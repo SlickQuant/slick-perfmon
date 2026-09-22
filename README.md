@@ -389,6 +389,20 @@ class Collector {
 - **The id space is shared in shm mode.** Give each process a disjoint range, or share
   ids deliberately so the numbers merge. Two processes publishing different names for
   one id is reported as a conflict, and the first name wins.
+- **`shm_name` is short on macOS.** A session needs two segments, the ring under the
+  name and the control block under `name + ".meta"`, and macOS caps a POSIX shm name at
+  31 bytes including the leading `/` where Linux and Windows allow far more. That leaves
+  **25 characters** for `config::shm_name` there against 249 elsewhere, so `start()`
+  checks the length itself and throws `std::invalid_argument` naming the limit — an
+  over-long name would otherwise open the ring, fail on the control block, and surface
+  as a bare `false` or as "File name too long" from inside a dependency.
+  `SLICK_PERFMON_SHM_NAME_MAX` carries the figure and can be overridden.
+- **Overhead figures need a cycle counter.** Off x86 `read_tsc()` falls back to
+  `steady_clock`, which on Apple Silicon resolves to ~41.67 ns — coarser than the stamp
+  being measured. `overhead_cycles()` is a *minimum* over many pairs, so it legitimately
+  reads 0 there, and `subtract_overhead` can measure an overhead larger than a whole
+  span and clamp every stage to zero. Leave it off on those platforms; the per-stamp
+  figures in this README are x86 numbers and say so.
 - **`shutdown()` must not race with active instrumentation.** Retired rings are held
   until the `Collector` is destroyed, so a stamp in flight across `shutdown()` is safe;
   one in flight across `~Collector` is not.

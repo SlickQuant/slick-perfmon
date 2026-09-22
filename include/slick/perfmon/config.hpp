@@ -86,13 +86,50 @@
 #define SLICK_PERFMON_CACHE_LINE_SIZE 64
 #define SLICK_PERFMON_CACHE_ALIGNED alignas(SLICK_PERFMON_CACHE_LINE_SIZE)
 
+/// Longest `config::shm_name` the platform can carry.
+///
+/// A shared session needs two segments - the ring under the name itself and the
+/// control block under name + SLICK_PERFMON_META_SUFFIX - so the budget is
+/// whatever the platform allows a segment name, less the leading '/' that POSIX
+/// requires and slick-shm prepends, less the suffix.
+///
+/// macOS is the binding case by a wide margin: PSHMNAMLEN caps a shm_open()
+/// name at 31 bytes where Linux allows NAME_MAX. Over the limit, shm_open()
+/// returns ENAMETOOLONG and what reaches the caller is "File name too long"
+/// from inside a dependency, or a bare false - which is why start() checks this
+/// itself and says which knob was wrong.
+///
+/// Overridable so the tightest budget can be exercised on a platform that does
+/// not impose it - CI builds one Linux job at the macOS figure, because a name
+/// that is too long fails nowhere else.
+#ifndef SLICK_PERFMON_SHM_NAME_MAX
+    #if defined(__APPLE__)
+        #define SLICK_PERFMON_SHM_NAME_MAX 25
+    #elif defined(_WIN32)
+        // Named kernel objects, capped at MAX_PATH.
+        #define SLICK_PERFMON_SHM_NAME_MAX 249
+    #else
+        // /dev/shm/<name>, so NAME_MAX applies to the name alone.
+        #define SLICK_PERFMON_SHM_NAME_MAX 249
+    #endif
+#endif
+
+/// Suffix distinguishing the control-block segment from the ring segment.
+#define SLICK_PERFMON_META_SUFFIX ".meta"
+
 // x86 is the only architecture where this library delivers on its overhead
 // budget. Everything else falls back to steady_clock, which is correct but
 // costs an order of magnitude more - so it warns rather than pretending.
-#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
-    #define SLICK_PERFMON_X86 1
-#else
-    #define SLICK_PERFMON_X86 0
+//
+// Overridable to 0, which is how the fallback path gets built and tested on an
+// x86 machine. Overriding it to 1 on a machine without RDTSC does not work and
+// is not meant to: the detection below is the only thing that can answer that.
+#ifndef SLICK_PERFMON_X86
+    #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+        #define SLICK_PERFMON_X86 1
+    #else
+        #define SLICK_PERFMON_X86 0
+    #endif
 #endif
 
 /// Two-level concatenation, so __LINE__ expands before it is pasted.

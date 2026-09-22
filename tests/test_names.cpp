@@ -167,12 +167,12 @@ TEST(Names, AttachingASegmentThatDoesNotExistFailsQuietly) {
     // The normal "no collector is running" case. It must be cheap and silent,
     // not an exception.
     ControlBlockOwner cb;
-    EXPECT_FALSE(cb.attach_shared(unique_shm_name("slick_perfmon_absent"), 64));
+    EXPECT_FALSE(cb.attach_shared(unique_shm_name("absent"), 64));
     EXPECT_FALSE(static_cast<bool>(cb));
 }
 
 TEST(Names, SharedSegmentsAgreeAcrossOwners) {
-    const std::string name = unique_shm_name("slick_perfmon_names");
+    const std::string name = unique_shm_name("names");
 
     ControlBlockOwner creator;
     ASSERT_TRUE(creator.create_shared(name, 64));
@@ -189,7 +189,7 @@ TEST(Names, SharedSegmentsAgreeAcrossOwners) {
 TEST(Names, AttachingWithAMismatchedCapacityThrows) {
     // A peer configured differently would read the name table at the wrong
     // stride, so this has to fail loudly rather than return nonsense.
-    const std::string name = unique_shm_name("slick_perfmon_mismatch");
+    const std::string name = unique_shm_name("mismatch");
 
     ControlBlockOwner creator;
     ASSERT_TRUE(creator.create_shared(name, 64));
@@ -216,7 +216,7 @@ TEST(Names, ClaimedNamesCountsWhatHasBeenPublished) {
 }
 
 TEST(Names, ClaimedNamesGrowsWhenAPeerPublishesLater) {
-    const std::string name = slick::perfmon::test::unique_shm_name("perfmon_claimed");
+    const std::string name = slick::perfmon::test::unique_shm_name("claimed");
 
     ControlBlockOwner collector;
     ASSERT_TRUE(collector.create_shared(name, 64));
@@ -260,7 +260,7 @@ TEST(Names, GenerationMovesOnlyWhenANameBecomesReadable) {
 }
 
 TEST(Names, GenerationSeesAPeerPublishingLater) {
-    const std::string name = unique_shm_name("perfmon_generation");
+    const std::string name = unique_shm_name("generation");
 
     ControlBlockOwner collector;
     ASSERT_TRUE(collector.create_shared(name, 64));

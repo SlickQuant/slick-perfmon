@@ -85,6 +85,35 @@ jobs:
       working-directory: build
       run: ctest -C Release --output-on-failure
 
+  # Two constraints that only bite on platforms the matrix runs last, if at all,
+  # so they are forced onto a Linux job where a regression shows up immediately:
+  #
+  #  - SHM_NAME_MAX=25 is the macOS figure (PSHMNAMLEN caps a shm_open() name at
+  #    31 bytes against NAME_MAX here). An over-long name fails nowhere else.
+  #  - X86=0 is the steady_clock fallback every non-x86 build takes. It is the
+  #    code AppleClang on arm64 actually compiles, and nothing else builds it.
+  #
+  # This does not reproduce the *coarse* clock an arm64 machine has, only the
+  # code path - the matrix's macos-latest job is still what covers that.
+  constrained-platform-build:
+    name: macOS constraints on Linux
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Configure CMake
+      run: >
+        cmake -B build -DCMAKE_BUILD_TYPE=Debug
+        -DCMAKE_CXX_FLAGS="-DSLICK_PERFMON_SHM_NAME_MAX=25 -DSLICK_PERFMON_X86=0 -Wno-cpp"
+
+    - name: Build
+      run: cmake --build build --config Debug -j 4
+
+    - name: Run tests
+      working-directory: build
+      run: ctest -C Debug --output-on-failure
+
   # Unfenced timestamps are a supported configuration, so they have to keep
   # compiling and passing.
   unserialized-build:

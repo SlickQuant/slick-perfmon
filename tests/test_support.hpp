@@ -61,10 +61,39 @@ inline config quiet_config() {
 
 /// Unique-per-run shared-memory name, so a crashed earlier run cannot leave a
 /// stale segment that makes the next one fail mysteriously.
-inline std::string unique_shm_name(const char* prefix) {
+/// A shm name unique to this run that fits the platform's limit.
+///
+/// Built here rather than spelled out at each call site because the budget is
+/// far tighter than it looks: macOS caps a POSIX shm name at 31 bytes including
+/// the leading '/', and a collector session needs both <name> and <name>.meta,
+/// which leaves 25 against 249 on Linux and Windows. Names that fit everywhere
+/// else fail only on macOS, and only sometimes - a decimal random suffix varies
+/// in width, so the same test passes or fails on the draw. Sizing against the
+/// same constant start() validates, with a fixed-width suffix, removes both.
+inline std::string unique_shm_name(const char* tag) {
     std::random_device                      rd;
     std::uniform_int_distribution<uint32_t> dist;
-    return std::string(prefix) + "_" + std::to_string(dist(rd));
+
+    constexpr size_t kUniqueChars = 8;  // one uint32 in hex, always this wide
+
+    // The truncation below subtracts from the budget, so a budget smaller than
+    // the parts would wrap rather than shorten anything.
+    static_assert(SLICK_PERFMON_SHM_NAME_MAX >= 16,
+                  "shm name budget too small to hold a tag and a unique suffix");
+
+    std::string name = "spm_";
+    name += tag;
+    if (name.size() + 1 + kUniqueChars > SLICK_PERFMON_SHM_NAME_MAX) {
+        name.resize(SLICK_PERFMON_SHM_NAME_MAX - 1 - kUniqueChars);
+    }
+
+    static constexpr char kHex[] = "0123456789abcdef";
+    const uint32_t        r      = dist(rd);
+    name += '_';
+    for (int shift = 28; shift >= 0; shift -= 4) {
+        name += kHex[(r >> shift) & 0xFu];
+    }
+    return name;
 }
 
 }  // namespace slick::perfmon::test

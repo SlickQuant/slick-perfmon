@@ -534,6 +534,20 @@ private:
         if (cfg_.run_mode != mode::local && cfg_.shm_name.empty()) {
             throw std::invalid_argument("slick-perfmon: the shared modes require a shm_name");
         }
+        // Checked here rather than left to shm_open(). Over the platform limit
+        // the ring segment can still open while the control block - one suffix
+        // longer - cannot, so the failure arrives as a bare false from a
+        // half-built session, or as "File name too long" from inside a
+        // dependency. Neither names the knob that was wrong. macOS is where
+        // this bites: 25 characters against 249 elsewhere.
+        if (cfg_.run_mode != mode::local &&
+            cfg_.shm_name.size() > SLICK_PERFMON_SHM_NAME_MAX) {
+            throw std::invalid_argument(
+                "slick-perfmon: shm_name is " + std::to_string(cfg_.shm_name.size()) +
+                " characters, and this platform allows at most " +
+                std::to_string(SLICK_PERFMON_SHM_NAME_MAX) + " (the control block is stored "
+                "under shm_name + \"" SLICK_PERFMON_META_SUFFIX "\", which has to fit too)");
+        }
         for (double p : cfg_.percentiles) {
             // A NaN passes every bounds check a percentile is given, every
             // comparison against it being false, so it would reach the rank
@@ -603,7 +617,9 @@ private:
      * of thing that goes unnoticed for months.
      */
     bool open_transport() {
-        const std::string meta = cfg_.shm_name + ".meta";
+        // validate_config() sizes shm_name against this same suffix, so the two
+        // have to stay spelled the same way.
+        const std::string meta = cfg_.shm_name + SLICK_PERFMON_META_SUFFIX;
 
         switch (cfg_.run_mode) {
         case mode::local:

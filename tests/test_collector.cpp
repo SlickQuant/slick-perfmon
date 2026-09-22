@@ -351,7 +351,7 @@ TEST(CollectorTest, AProducerWithNoCollectorRunningStartsDisabled) {
     Collector c;
     config    cfg = quiet_config();
     cfg.run_mode  = mode::shared_producer;
-    cfg.shm_name  = unique_shm_name("slick_perfmon_nobody");
+    cfg.shm_name  = unique_shm_name("nobody");
 
     EXPECT_FALSE(c.start(cfg)) << "attaching a segment nobody created must fail quietly";
     EXPECT_FALSE(c.enabled());
@@ -371,7 +371,17 @@ TEST(CollectorTest, MeasuresItsOwnOverhead) {
 
     // Always measured even though it is not subtracted by default: the floor is
     // what says whether a short measurement is real.
+    //
+    // Only x86 can require it to be non-zero. Elsewhere read_tsc() falls back to
+    // steady_clock, which on Apple Silicon resolves to ~41.67 ns - coarser than
+    // the stamp being measured. measure_overhead() takes the *minimum* over a
+    // thousand pairs, and a minimum over quantised samples reaches zero as soon
+    // as one pair lands inside a single tick. Zero is the truthful answer there,
+    // "below what this clock can see", not a broken calibration - which is what
+    // the upper bound below is for, and that one holds everywhere.
+#if SLICK_PERFMON_X86
     EXPECT_GT(c.overhead_cycles(), 0u);
+#endif
     EXPECT_LT(c.overhead_cycles(), 100000u) << "an absurd figure means a broken calibration";
     c.shutdown();
 }
@@ -542,6 +552,17 @@ TEST(CollectorTest, SubtractOverheadReachesThePairer) {
 
     ASSERT_EQ(raw.s.count, kSpans);
     ASSERT_EQ(sub.s.count, kSpans);
+
+#if !SLICK_PERFMON_X86
+    // The rest cannot be asserted through timing off x86, whatever the pairer
+    // does. The fallback clock is coarser than the thing being measured: the
+    // calibrated overhead can come out larger than an entire span, record()
+    // then clamps the subtraction at zero, and both runs bottom out at zero or
+    // one tick whichever way subtract_overhead was set. The mechanism is not
+    // platform-specific and is asserted above on x86; what is missing here is a
+    // clock able to resolve it.
+    GTEST_SKIP() << "the fallback clock is too coarse to resolve one stamp";
+#else
     ASSERT_GT(sub.overhead, 0u) << "the floor is always measured";
     ASSERT_GT(raw.s.min, 0.0) << "a fenced stamp pair cannot take zero cycles";
 
@@ -551,6 +572,7 @@ TEST(CollectorTest, SubtractOverheadReachesThePairer) {
     EXPECT_LT(sub.s.min, raw.s.min) << "the subtraction never reached the pairer";
     EXPECT_GE(raw.s.min - sub.s.min, static_cast<double>(sub.overhead) / 2.0)
         << "the gap should be of the order of one stamp, not of the noise";
+#endif
 }
 
 TEST(CollectorTest, RestartDoesNotCarryThePeakForward) {

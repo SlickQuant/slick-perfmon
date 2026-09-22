@@ -76,7 +76,7 @@ config collector_config(const std::string& shm) {
 }  // namespace
 
 TEST(Shm, CollectsSpansFromAnotherProcess) {
-    const std::string shm = unique_shm_name("slick_perfmon_basic");
+    const std::string shm = unique_shm_name("basic");
 
     Collector c;
     ASSERT_TRUE(c.start(collector_config(shm)));
@@ -98,7 +98,7 @@ TEST(Shm, CollectsSpansFromAnotherProcess) {
 }
 
 TEST(Shm, NamesPublishedByTheCollectorLabelAnotherProcessSpans) {
-    const std::string shm = unique_shm_name("slick_perfmon_names2");
+    const std::string shm = unique_shm_name("names2");
 
     Collector c;
     ASSERT_TRUE(c.start(collector_config(shm)));
@@ -121,7 +121,7 @@ TEST(Shm, NamesPublishedByTheCollectorLabelAnotherProcessSpans) {
 
 TEST(Shm, TwoProducersOnDisjointPointRangesDoNotInterfere) {
     // The documented way to keep processes apart: partition the id space.
-    const std::string shm = unique_shm_name("slick_perfmon_two");
+    const std::string shm = unique_shm_name("two");
 
     Collector c;
     ASSERT_TRUE(c.start(collector_config(shm)));
@@ -146,7 +146,7 @@ TEST(Shm, TwoProducersSharingOnePointMergeIntoOneRow) {
     // The other documented option: share an id deliberately so the numbers
     // combine. Each process takes its own seq range, so the spans stay
     // distinguishable even though they land on the same point.
-    const std::string shm = unique_shm_name("slick_perfmon_merge");
+    const std::string shm = unique_shm_name("merge");
 
     Collector c;
     ASSERT_TRUE(c.start(collector_config(shm)));
@@ -170,7 +170,7 @@ TEST(Shm, TwoProducersWithCollidingSeqsAreDetectedNotMispaired) {
     // The failure mode of the test above: both processes using seq 1..N on one
     // point. What matters is that it shows up in the anomaly counters rather
     // than as a believable latency.
-    const std::string shm = unique_shm_name("slick_perfmon_collide");
+    const std::string shm = unique_shm_name("collide");
 
     Collector c;
     ASSERT_TRUE(c.start(collector_config(shm)));
@@ -195,7 +195,7 @@ TEST(Shm, TwoProducersWithCollidingSeqsAreDetectedNotMispaired) {
 TEST(Shm, SpansLeftOpenByAProducerAreEventuallyAbandoned) {
     // A producer that exits mid-span - or dies - must not leak an open-span
     // slot for the life of the collector.
-    const std::string shm = unique_shm_name("slick_perfmon_leak");
+    const std::string shm = unique_shm_name("leak");
 
     config cfg                 = collector_config(shm);
     cfg.stalled_sample_timeout = std::chrono::milliseconds(50);
@@ -223,7 +223,7 @@ TEST(Shm, SpansLeftOpenByAProducerAreEventuallyAbandoned) {
 TEST(Shm, AProducerStartedBeforeTheCollectorRecordsNothingAndSaysSo) {
     // The safe default: an instrumented binary in production with no collector
     // attached costs nothing and creates nothing.
-    const std::string shm = unique_shm_name("slick_perfmon_early");
+    const std::string shm = unique_shm_name("early");
 
     const int rc = run_producer(shm, kPointA, 100);
     EXPECT_NE(rc, 0) << "the producer should report that no collector was there";
@@ -237,7 +237,7 @@ TEST(Shm, AProducerStartedBeforeTheCollectorRecordsNothingAndSaysSo) {
 }
 
 TEST(Shm, AttachingWithAMismatchedNameTableThrows) {
-    const std::string shm = unique_shm_name("slick_perfmon_badcfg");
+    const std::string shm = unique_shm_name("badcfg");
 
     Collector collector;
     ASSERT_TRUE(collector.start(collector_config(shm)));
@@ -254,9 +254,56 @@ TEST(Shm, AttachingWithAMismatchedNameTableThrows) {
     collector.shutdown();
 }
 
+TEST(Shm, AnOverLongShmNameIsRefusedByName) {
+    // The bug this guards: nothing checked the name against the platform limit,
+    // so on macOS - where PSHMNAMLEN caps a shm_open() name at 31 bytes against
+    // 249 elsewhere - the ring segment would open under `name` while the control
+    // block one suffix longer would not. What reached the caller was a bare
+    // false from a half-built session, or "File name too long" thrown out of a
+    // dependency. Neither said which knob was wrong, and neither happened on the
+    // machine the config was written on.
+    Collector c;
+    config    cfg = quiet_config();
+    cfg.run_mode  = mode::shared_producer;
+    cfg.shm_name  = std::string(SLICK_PERFMON_SHM_NAME_MAX + 1, 'x');
+
+    EXPECT_THROW((void)c.start(cfg), std::invalid_argument);
+
+    // And the boundary itself is accepted, so the limit is off-by-one clean.
+    // create_if_absent because there is no collector on this name to attach to.
+    config ok           = quiet_config();
+    ok.run_mode         = mode::shared_producer;
+    ok.create_if_absent = true;
+    ok.shm_name         = unique_shm_name("edge");
+    ASSERT_LE(ok.shm_name.size(), static_cast<size_t>(SLICK_PERFMON_SHM_NAME_MAX));
+    Collector edge;
+    EXPECT_TRUE(edge.start(ok)) << "a name inside the budget must open both segments";
+    edge.shutdown();
+}
+
+TEST(Shm, UniqueShmNameStaysInsideThePlatformBudget) {
+    // unique_shm_name() is what keeps every shm test inside the platform limit,
+    // and an over-long name fails only on macOS - so without this the regression
+    // comes back as a red CI job on one platform months later.
+    //
+    // The long tags are the point: the helper has to truncate rather than hand
+    // back something the platform will reject. "slick_perfmon_early" is the real
+    // one from the run that found this, when names were built as the tag plus a
+    // *decimal* suffix - 26 to 33 characters against a budget of 25, and varying
+    // in width, so the same test passed or failed on the draw.
+    for (const char* tag : {"basic", "collide", "generation", "slick_perfmon_early",
+                            "a_tag_far_longer_than_any_platform_would_accept"}) {
+        const std::string name = unique_shm_name(tag);
+        EXPECT_LE(name.size(), static_cast<size_t>(SLICK_PERFMON_SHM_NAME_MAX))
+            << "tag " << tag << " produced " << name;
+        EXPECT_FALSE(name.empty());
+        EXPECT_NE(name, unique_shm_name(tag)) << "names must stay unique after truncation";
+    }
+}
+
 TEST(Shm, AProducerCanCreateTheSegmentWhenAskedTo) {
     // The escape hatch for the reverse startup order.
-    const std::string shm = unique_shm_name("slick_perfmon_create");
+    const std::string shm = unique_shm_name("create");
 
     Collector producer;
     config    cfg       = quiet_config();
@@ -296,7 +343,7 @@ TEST(Shm, ANameIsReusableWithADifferentConfigurationAfterShutdown) {
     // a different max_names then hit the peer-mismatch throw against nothing
     // but its own corpse. On Windows the segment is refcounted by handle and
     // this already held, which is precisely why it needed a test.
-    const std::string shm = unique_shm_name("slick_perfmon_reuse");
+    const std::string shm = unique_shm_name("reuse");
 
     {
         Collector c;
@@ -316,7 +363,7 @@ TEST(Shm, ANameIsReusableWithADifferentConfigurationAfterShutdown) {
 TEST(Shm, AReusedNameDoesNotResurrectTheOldSessionsLabels) {
     // The other half of the leak: a stale block kept its name table, so a rerun
     // that renamed a point silently reported it under the previous run's label.
-    const std::string shm = unique_shm_name("slick_perfmon_relabel");
+    const std::string shm = unique_shm_name("relabel");
 
     {
         Collector c;

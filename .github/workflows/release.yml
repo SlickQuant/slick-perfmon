@@ -17,7 +17,21 @@ jobs:
     - name: Extract changelog section
       id: changelog
       run: |
-        bash tools/extract_changelog.sh "$GITHUB_REF_NAME" CHANGELOG.md > release_notes.md
+        # Match the version as a whole token: the heading carries a date after it
+        # ("## v0.1.0 - 09-22-2026"), so this cannot compare the whole line, and a
+        # bare prefix would hand v0.1.0's release the notes from v0.1.0-rc1.
+        # "### " subheadings are body - only a "## " heading ends the section.
+        VERSION_ESCAPED=$(echo "$GITHUB_REF_NAME" | sed 's/\./\\./g')
+        awk "/^## ${VERSION_ESCAPED}([[:space:]]|\$)/ { p = 1; next }
+             /^## / { if (p) exit }
+             p" CHANGELOG.md | sed -e '/./,$!d' > release_notes.md
+
+        # An empty slice would otherwise publish an empty release, and only be
+        # noticed after the tag is pushed.
+        if ! grep -q '[^[:space:]]' release_notes.md; then
+          echo "::error::No CHANGELOG.md section for $GITHUB_REF_NAME" >&2
+          exit 1
+        fi
         echo "Release notes:"; cat release_notes.md
 
     - name: Package headers

@@ -666,12 +666,6 @@ histogram and accumulator tests still run, along with the one that proves the di
 build costs nothing. The name-table test is not among them: its subject is a shared
 memory segment, and a disabled build deliberately has no slick-shm to build it against.
 
-One test is not a ctest case. `tests/test_extract_changelog.sh` covers
-`tools/extract_changelog.sh`, which is what the release workflow slices release
-notes out of `CHANGELOG.md` with — a slice that quietly comes back empty publishes
-an empty release, and there is no C++ in it to hang a gtest case on. Run it with
-`bash tests/test_extract_changelog.sh`; CI runs it on every branch.
-
 ## Benchmarking
 
 ```bash

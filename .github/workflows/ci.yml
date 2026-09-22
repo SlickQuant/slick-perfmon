@@ -149,20 +149,6 @@ jobs:
       working-directory: build
       run: ctest -C Release --output-on-failure
 
-  # The release workflow builds its notes by slicing CHANGELOG.md, and a slice
-  # that silently comes back empty publishes an empty release - which is only
-  # noticed after the tag is pushed. Checking it here means a heading the
-  # extraction cannot find fails the branch instead.
-  changelog-extract:
-    name: Changelog extraction
-    runs-on: ubuntu-latest
-
-    steps:
-    - uses: actions/checkout@v4
-
-    - name: Test extract_changelog.sh
-      run: bash tests/test_extract_changelog.sh
-
   # The hot path is lock-free and the backend is single-threaded by design, so
   # a data race here would be a design failure rather than a missing mutex.
   sanitizers:

@@ -117,6 +117,17 @@
 /// Suffix distinguishing the control-block segment from the ring segment.
 #define SLICK_PERFMON_META_SUFFIX ".meta"
 
+/// Quantise the non-x86 fallback clock to this many nanoseconds. 0 leaves it
+/// alone, which is the only setting a real build should ever use.
+///
+/// Exists so the *coarseness* of a real fallback clock can be reproduced on a
+/// machine that does not have one: Apple Silicon's steady_clock advances in
+/// ~41.67 ns steps, which is coarser than a stamp, so intervals legitimately
+/// measure zero there and nowhere else. See detail::rdtsc_begin().
+#ifndef SLICK_PERFMON_CLOCK_GRANULARITY_NS
+#define SLICK_PERFMON_CLOCK_GRANULARITY_NS 0
+#endif
+
 // x86 is the only architecture where this library delivers on its overhead
 // budget. Everything else falls back to steady_clock, which is correct but
 // costs an order of magnitude more - so it warns rather than pretending.

@@ -146,8 +146,17 @@ TEST(Tsc, CyclesOutputUnitSkipsConversionEntirely) {
 
     const stats s = c.snapshot_total(to_point(pt::sleeper));
     EXPECT_EQ(s.count, 100u);
+#if SLICK_PERFMON_X86
     // Raw cycles for an empty span sit in the tens-to-hundreds range; if this
     // had been converted to nanoseconds it would be far smaller.
     EXPECT_GT(s.min, 1.0);
+#else
+    // Off x86 there is no conversion left to catch: the fallback clock counts
+    // nanoseconds, so `cycles` and `nanoseconds` are the same number and this
+    // property is the identity. The clock is also coarser than an empty span -
+    // ~41.67 ns on Apple Silicon - so s.min is legitimately zero, whole spans
+    // having landed inside one tick. Only the aggregate is still meaningful.
+    EXPECT_GT(s.max, 0.0) << "100 spans cannot all have fitted inside one tick";
+#endif
     c.shutdown();
 }

@@ -896,10 +896,30 @@ TEST(Output, TheCorrectionItAppliedIsInTheFile) {
     ASSERT_LT(c_overhead, header.size()) << "a corrected run has to say so in its schema";
     EXPECT_EQ(c_overhead, header.size() - 1) << "a trailing per-row constant, like tsc_hz";
 
+    double first = -1.0;
     for (size_t i = 1; i < lines.size(); ++i) {
-        const auto row = split(lines[i], ',');
+        const auto   row = split(lines[i], ',');
         ASSERT_EQ(row.size(), header.size()) << "row " << i;
-        EXPECT_GT(std::stod(row[c_overhead]), 0.0) << "row " << i;
+        const double ov = std::stod(row[c_overhead]);
+
+#if SLICK_PERFMON_X86
+        EXPECT_GT(ov, 0.0) << "row " << i;
+#else
+        // Off x86 the fallback clock is coarser than a stamp - ~41.67 ns on
+        // Apple Silicon - and measure_overhead() takes a *minimum*, so the
+        // calibration legitimately comes back as nothing to subtract. A zero
+        // correction is still a correction the file has to state.
+        EXPECT_GE(ov, 0.0) << "row " << i;
+#endif
+
+        // A per-row constant like tsc_hz, and the reason the column exists at
+        // all: a reader puts the correction back by adding this to every
+        // latency beside it, which only works if every row agrees on it.
+        if (first < 0.0) {
+            first = ov;
+        } else {
+            EXPECT_DOUBLE_EQ(ov, first) << "row " << i;
+        }
     }
 }
 

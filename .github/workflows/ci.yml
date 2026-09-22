@@ -92,11 +92,26 @@ jobs:
   #    31 bytes against NAME_MAX here). An over-long name fails nowhere else.
   #  - X86=0 is the steady_clock fallback every non-x86 build takes. It is the
   #    code AppleClang on arm64 actually compiles, and nothing else builds it.
+  #  - CLOCK_GRANULARITY_NS quantises that fallback, which is the part that
+  #    actually bites: Apple Silicon's steady_clock advances in ~41.67 ns steps,
+  #    so whole spans land inside one tick and measure zero, and every "this
+  #    interval must be positive" assertion fails. Linux has a nanosecond clock
+  #    and cannot show that on its own.
   #
-  # This does not reproduce the *coarse* clock an arm64 machine has, only the
-  # code path - the matrix's macos-latest job is still what covers that.
+  # 100 ns rather than 42: the quantisation has to be coarse relative to a
+  # *stamp*, and a stamp is cheaper here than on Apple Silicon because
+  # clock_gettime is a vDSO call on Linux. 100 reproduces the failures that job
+  # found and nothing else; coarser starts breaking tests macOS passes.
+  #
+  # Release because that is where it showed up - faster stamps fit inside a tick
+  # more often, so Debug hides half of these.
   constrained-platform-build:
     name: macOS constraints on Linux
+    strategy:
+      fail-fast: false
+      matrix:
+        build_type: [Debug, Release]
+
     runs-on: ubuntu-latest
 
     steps:
@@ -104,15 +119,16 @@ jobs:
 
     - name: Configure CMake
       run: >
-        cmake -B build -DCMAKE_BUILD_TYPE=Debug
-        -DCMAKE_CXX_FLAGS="-DSLICK_PERFMON_SHM_NAME_MAX=25 -DSLICK_PERFMON_X86=0 -Wno-cpp"
+        cmake -B build -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+        -DCMAKE_CXX_FLAGS="-DSLICK_PERFMON_SHM_NAME_MAX=25 -DSLICK_PERFMON_X86=0
+        -DSLICK_PERFMON_CLOCK_GRANULARITY_NS=100 -Wno-cpp"
 
     - name: Build
-      run: cmake --build build --config Debug -j 4
+      run: cmake --build build --config ${{ matrix.build_type }} -j 4
 
     - name: Run tests
       working-directory: build
-      run: ctest -C Debug --output-on-failure
+      run: ctest -C ${{ matrix.build_type }} --output-on-failure
 
   # Unfenced timestamps are a supported configuration, so they have to keep
   # compiling and passing.

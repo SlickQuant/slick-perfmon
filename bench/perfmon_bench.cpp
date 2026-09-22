@@ -316,6 +316,19 @@ int main(int argc, char** argv) {
 #endif
     std::printf("iters=%d reps=%d\n", g_iters, g_reps);
 
+    // The benchmark's own code is compiled /O2 or -O3 whatever the
+    // configuration selects, but a debug *configuration* still links the debug
+    // C runtime, and that alone costs roughly 3x per stamp. The binary builds
+    // there - CI builds every target in both configurations - so it has to say
+    // when its numbers are not the ones the README quotes, rather than printing
+    // plausible figures that are wrong by a factor.
+#if defined(_ITERATOR_DEBUG_LEVEL) && _ITERATOR_DEBUG_LEVEL != 0
+    std::printf("WARNING: built against a debug C runtime (_ITERATOR_DEBUG_LEVEL=%d).\n"
+                "         These numbers are not comparable with a release build -\n"
+                "         use one before quoting any of them.\n",
+                _ITERATOR_DEBUG_LEVEL);
+#endif
+
     Collector c;
     config    cfg      = {};
     cfg.point_count    = 1;

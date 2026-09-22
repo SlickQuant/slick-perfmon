@@ -96,8 +96,23 @@ inline bool probe_invariant_tsc() noexcept {
 #endif
 
 SLICK_PERFMON_FORCE_INLINE uint64_t rdtsc_begin() noexcept {
-    return static_cast<uint64_t>(
+    const uint64_t ns = static_cast<uint64_t>(
         std::chrono::steady_clock::now().time_since_epoch().count());
+#if SLICK_PERFMON_CLOCK_GRANULARITY_NS
+    // Test hook, never on by default and never compiled on x86.
+    //
+    // The interesting thing about this fallback is not that it is slow, it is
+    // that it is *coarse*: on Apple Silicon steady_clock is the 24 MHz mach
+    // timebase, so it advances in ~41.67 ns steps and a whole span can land
+    // inside one of them and measure zero. Every assertion that some measured
+    // interval is strictly positive then fails - on that machine, in that job,
+    // and nowhere a developer is looking. Linux has a nanosecond clock and
+    // cannot reproduce it, so CI builds one job with this set and gets the
+    // behaviour rather than the argument about it.
+    return ns - (ns % SLICK_PERFMON_CLOCK_GRANULARITY_NS);
+#else
+    return ns;
+#endif
 }
 
 SLICK_PERFMON_FORCE_INLINE uint64_t rdtsc_step() noexcept { return rdtsc_begin(); }

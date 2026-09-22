@@ -17,12 +17,7 @@ jobs:
     - name: Extract changelog section
       id: changelog
       run: |
-        VERSION="${GITHUB_REF_NAME#v}"
-        awk -v ver="## v${VERSION}" '
-          $0 == ver { found = 1; next }
-          found && /^## / { exit }
-          found { print }
-        ' CHANGELOG.md > release_notes.md
+        bash tools/extract_changelog.sh "$GITHUB_REF_NAME" CHANGELOG.md > release_notes.md
         echo "Release notes:"; cat release_notes.md
 
     - name: Package headers

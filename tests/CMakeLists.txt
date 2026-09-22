@@ -32,6 +32,7 @@ endfunction()
 # and behave.
 set(SLICK_PERFMON_LOGIC_TESTS
     test_event_id.cpp
+    test_sample.cpp
     test_histogram.cpp
     test_accumulator.cpp
     test_open_map.cpp

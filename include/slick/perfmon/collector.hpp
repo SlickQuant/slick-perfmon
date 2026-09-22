@@ -749,7 +749,13 @@ private:
 
         stalled_since_ = {};
         for (uint32_t i = 0; i < n; ++i) {
-            pairer_.on_event(ptr[i]);
+            // Snapshot, not a reference into the ring. read() hands back a
+            // pointer to live slot memory, and an overwriting ring means a
+            // producer that laps us can rewrite that slot while the pairer is
+            // still reading fields out of it. load() takes one defined,
+            // self-consistent copy; see sample::load().
+            const sample s = ptr[i].load();
+            pairer_.on_event(s);
         }
         return true;
     }
@@ -815,6 +821,9 @@ private:
                 break;
             }
             for (uint32_t i = 0; i < n; ++i) {
+                // A plain read, unlike drain_once(): `cal` is a local ring that
+                // this thread filled and is now draining, with no producer left
+                // to lap it.
                 ts.push_back(ptr[i].timestamp);
             }
         }

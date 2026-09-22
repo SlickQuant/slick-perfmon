@@ -72,10 +72,9 @@ SLICK_PERFMON_FORCE_INLINE void stamp_into(sample_queue& q, point_id p, event_id
     // reserve(1) cannot throw: it only rejects n == 0 or n > capacity, and the
     // collector validates capacity >= 2 before any ring reaches this function.
     const uint64_t slot = q.reserve();
-    sample* s = q[slot];
-    s->timestamp = t;
-    s->point     = p;
-    s->event     = e;
+    // Relaxed atomic stores, not plain ones: the ring overwrites, so this write
+    // can overlap the collector reading the same slot. See sample::store().
+    q[slot]->store(t, p, e);
     q.publish(slot);
 }
 

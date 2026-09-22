@@ -61,9 +61,16 @@ TEST(EventId, BeginAndEndAreDistinctFromEveryIntermediateStep) {
     }
 }
 
-TEST(EventId, PointAndEventAreAdjacentSoTheStoresCanMerge) {
-    // Not cosmetic: two adjacent 4-byte stores of constants become one 8-byte
-    // immediate store, which is the whole reason for the split layout.
+TEST(EventId, PointAndEventAreAdjacentAndTheRecordStartsAtTheTimestamp) {
+    // Not cosmetic. The layout is the cross-process contract for a shared ring,
+    // and keeping the three fields packed into 16 aligned bytes is what lets a
+    // snapshot of a slot be one cache line and never two.
+    //
+    // It used to also let the compiler fuse `point` and `event` into a single
+    // 8-byte immediate store. It no longer can: those are relaxed atomic stores
+    // now, because a lapping producer overwrites a slot the collector is
+    // reading and plain stores made that undefined. The benchmark puts the lost
+    // merge inside the run-to-run noise. See sample::store().
     EXPECT_EQ(offsetof(sample, point) + sizeof(point_id), offsetof(sample, event));
     EXPECT_EQ(offsetof(sample, timestamp), 0u);
 }

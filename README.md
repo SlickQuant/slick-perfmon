@@ -373,7 +373,10 @@ class Collector {
 - **The ring overwrites; it never blocks.** A producer that outruns the collector loses
   samples, and a lost stamp corrupts *pairing* rather than just perturbing one number.
   Check `dropped` first whenever `orphan` or `abandoned` climb, and raise
-  `queue_capacity`.
+  `queue_capacity`. The overwrite itself is safe — producer and collector touch a
+  contended slot through relaxed atomics, so the overlap is defined rather than a data
+  race — but a sample it catches mid-write can mix two generations of the slot, which is
+  one more reason `dropped` has to be read before the latencies beside it.
 - **One collector has a throughput ceiling.** Draining and pairing an event is cheaper
   than stamping one — ~90 cycles against ~200 — but there is one collector and as many
   producers as you instrument, and the collector also sweeps, aggregates and writes. In
@@ -429,8 +432,23 @@ back 30–70 cycles per stamp depending on the shape of the span, at the cost of
 the CPU move work across the timestamps.
 
 **The record** is 16 bytes: a raw TSC, a 32-bit point and a 32-bit event holding
-`(seq << 8) | step`. The two 32-bit fields are adjacent so the compiler merges them into
-one 8-byte store.
+`(seq << 8) | step`. The three fields are written with *relaxed* atomic stores and read
+back with relaxed atomic loads, which is a correctness requirement rather than a
+precaution: the ring overwrites, so a producer that laps the collector writes a slot the
+collector is reading. That overlap is deliberate and is counted as `dropped`, but with
+plain stores it is also a data race — undefined behaviour, and a ThreadSanitizer
+failure. Relaxed atomics make it a *defined* overlap whose only consequence is a sample
+mixing two generations of the slot, which is exactly what `dropped` exists to warn about.
+Relaxed is the whole point: no fence, no ordering, no lock, and on x86-64 and AArch64
+each field lowers to the store instruction a plain assignment emitted. The only thing
+given up is store merging across the two adjacent 32-bit fields, and the benchmark puts
+that inside the run-to-run noise.
+
+The collector's side of the same contract: `drain_once()` snapshots each slot into a
+local before pairing it, rather than handing the pairer a reference into live ring
+memory. The pairer reads `event`, `point` and `timestamp` several times each, and a
+producer lapping between two of those reads would otherwise let it pair a step from one
+generation against a timestamp from another.
 
 **Backend.** A per-span state machine keyed by `(point, seq)`. `kNoSeq` is not a special
 case — it is simply the single bucket a point gets when its spans never overlap, so one

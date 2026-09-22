@@ -1,0 +1,40 @@
+name: Release
+
+on:
+  push:
+    tags: [ 'v*' ]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Extract changelog section
+      id: changelog
+      run: |
+        VERSION="${GITHUB_REF_NAME#v}"
+        awk -v ver="## v${VERSION}" '
+          $0 == ver { found = 1; next }
+          found && /^## / { exit }
+          found { print }
+        ' CHANGELOG.md > release_notes.md
+        echo "Release notes:"; cat release_notes.md
+
+    - name: Package headers
+      run: |
+        zip -r slick-perfmon-${GITHUB_REF_NAME}.zip include/ LICENSE README.md
+        tar czf slick-perfmon-${GITHUB_REF_NAME}.tar.gz include/ LICENSE README.md
+
+    - name: Publish draft release
+      uses: softprops/action-gh-release@v1
+      with:
+        draft: true
+        body_path: release_notes.md
+        files: |
+          slick-perfmon-*.zip
+          slick-perfmon-*.tar.gz

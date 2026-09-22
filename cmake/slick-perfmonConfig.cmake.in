@@ -1,0 +1,35 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+
+# How this package was *built*. These are baked in at configure time on purpose:
+# the alternative - reading SLICK_PERFMON_ENABLED out of the consumer's own cache
+# - answers a question about the consumer when the question is about the headers
+# that were installed. A consumer who happened to define the same option for an
+# unrelated reason would otherwise silently change which slick-perfmon they got.
+set(slick-perfmon_ENABLED @SLICK_PERFMON_ENABLED@)
+set(slick-perfmon_SERIALIZE @SLICK_PERFMON_SERIALIZE@)
+
+find_dependency(Threads)
+
+# A disabled package contains no ring and no control block, so it must not make
+# its consumers go and install the two libraries that back them.
+if(slick-perfmon_ENABLED)
+    find_dependency(slick-queue 2.0.0 CONFIG)
+    find_dependency(slick-shm CONFIG)
+endif()
+
+include("${CMAKE_CURRENT_LIST_DIR}/slick-perfmonTargets.cmake")
+
+# Restated here as well as on the exported target: the switch is what makes the
+# headers compile to nothing, and losing it to an export-format change would be
+# a silent re-enable rather than a build error. Repeating a definition CMake
+# already carries costs nothing - it is deduplicated on the command line.
+if(NOT slick-perfmon_ENABLED)
+    target_compile_definitions(slick::perfmon INTERFACE SLICK_PERFMON_ENABLED=0)
+endif()
+if(NOT slick-perfmon_SERIALIZE)
+    target_compile_definitions(slick::perfmon INTERFACE SLICK_PERFMON_SERIALIZE=0)
+endif()
+
+check_required_components(slick-perfmon)

@@ -1,0 +1,136 @@
+name: CI
+
+on:
+  push:
+    branches: [ '**' ]
+  pull_request:
+    branches: [ main ]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: ${{ matrix.os }} (${{ matrix.build_type }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        build_type: [Debug, Release]
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Configure CMake
+      run: cmake -B build -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} -DBUILD_SLICK_PERFMON_BENCH=ON
+
+    - name: Build
+      run: cmake --build build --config ${{ matrix.build_type }} -j 4
+
+    - name: Run tests
+      working-directory: build
+      run: ctest -C ${{ matrix.build_type }} --output-on-failure
+
+  # Clang on x86-64 Linux is not covered by the matrix above, which gets g++,
+  # AppleClang and MSVC. It is also the configuration most likely to disagree
+  # about the x86 intrinsic headers.
+  clang-linux:
+    name: Clang (${{ matrix.build_type }})
+    strategy:
+      fail-fast: false
+      matrix:
+        build_type: [Debug, Release]
+
+    runs-on: ubuntu-latest
+
+    env:
+      CC: clang
+      CXX: clang++
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Configure CMake
+      run: cmake -B build -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} -DBUILD_SLICK_PERFMON_BENCH=ON
+
+    - name: Build
+      run: cmake --build build --config ${{ matrix.build_type }} -j 4
+
+    - name: Run tests
+      working-directory: build
+      run: ctest -C ${{ matrix.build_type }} --output-on-failure
+
+  # The instrumentation-off build is a first-class configuration: it is what
+  # ships to production, and nothing else in the matrix compiles it.
+  disabled-build:
+    name: SLICK_PERFMON_ENABLED=OFF
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Configure CMake
+      run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DSLICK_PERFMON_ENABLED=OFF
+
+    - name: Build
+      run: cmake --build build --config Release -j 4
+
+    - name: Run tests
+      working-directory: build
+      run: ctest -C Release --output-on-failure
+
+  # Unfenced timestamps are a supported configuration, so they have to keep
+  # compiling and passing.
+  unserialized-build:
+    name: SLICK_PERFMON_SERIALIZE=OFF
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Configure CMake
+      run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DSLICK_PERFMON_SERIALIZE=OFF
+
+    - name: Build
+      run: cmake --build build --config Release -j 4
+
+    - name: Run tests
+      working-directory: build
+      run: ctest -C Release --output-on-failure
+
+  # The hot path is lock-free and the backend is single-threaded by design, so
+  # a data race here would be a design failure rather than a missing mutex.
+  sanitizers:
+    name: Sanitizers (${{ matrix.sanitizer }})
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [address, thread, undefined]
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Configure CMake
+      run: >
+        cmake -B build -DCMAKE_BUILD_TYPE=Debug
+        -DCMAKE_CXX_FLAGS="-fsanitize=${{ matrix.sanitizer }} -fno-omit-frame-pointer -g"
+        -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=${{ matrix.sanitizer }}"
+
+    - name: Build
+      run: cmake --build build --config Debug -j 4
+
+    - name: Run tests
+      working-directory: build
+      env:
+        ASAN_OPTIONS: abort_on_error=1:detect_stack_use_after_return=1
+        TSAN_OPTIONS: halt_on_error=1:second_deadlock_stack=1
+        UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+      run: ctest -C Debug --output-on-failure

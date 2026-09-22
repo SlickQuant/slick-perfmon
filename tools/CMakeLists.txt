@@ -1,0 +1,5 @@
+add_executable(slick_perfmon_collector slick_perfmon_collector.cpp)
+target_link_libraries(slick_perfmon_collector PRIVATE slick::perfmon)
+if(MSVC)
+    target_compile_options(slick_perfmon_collector PRIVATE /wd4324)
+endif()

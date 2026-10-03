@@ -360,6 +360,49 @@ TEST(Shm, ANameIsReusableWithADifferentConfigurationAfterShutdown) {
     second.shutdown();
 }
 
+TEST(Shm, ACollectorRestartsOnTheSameNameWithADifferentCapacity) {
+    // Regression: shutdown() retires the ring rather than freeing it, and a
+    // retired shared ring kept its segment - and with it the name - alive. The
+    // restart then opened the previous session's segment instead of creating
+    // its own, and threw "Shared memory size mismatch" against nothing but
+    // this Collector's own leftover. The test above uses two Collectors, so it
+    // never had a retired ring in the way.
+    const std::string shm = unique_shm_name("recap");
+
+    Collector c;
+    config    first     = collector_config(shm);
+    first.queue_capacity = 1024;
+    ASSERT_TRUE(c.start(first));
+    c.shutdown();
+
+    config second         = collector_config(shm);
+    second.queue_capacity = 4096;
+    EXPECT_NO_THROW({ ASSERT_TRUE(c.start(second)); });
+    c.shutdown();
+}
+
+TEST(Shm, ARestartedCollectorDrainsItsOwnSegment) {
+    // The quieter half of the same bug: with an unchanged capacity the restart
+    // did not throw, it attached to the previous session's segment as a
+    // non-owner beside a freshly created control block. What has to hold is
+    // that a producer arriving after the restart lands where it is drained.
+    const std::string shm = unique_shm_name("redrain");
+
+    Collector c;
+    ASSERT_TRUE(c.start(collector_config(shm)));
+    c.shutdown();
+    ASSERT_TRUE(c.start(collector_config(shm)));
+
+    constexpr int kSpans = 500;
+    ASSERT_EQ(run_producer(shm, kPointA, kSpans), 0);
+
+    c.flush();
+    const stats total = c.snapshot_total(kPointA);
+    EXPECT_EQ(total.count, kSpans);
+    EXPECT_EQ(total.orphan, 0u);
+    c.shutdown();
+}
+
 TEST(Shm, AReusedNameDoesNotResurrectTheOldSessionsLabels) {
     // The other half of the leak: a stale block kept its name table, so a rerun
     // that renamed a point silently reported it under the previous run's label.

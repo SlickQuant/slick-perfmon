@@ -405,7 +405,10 @@ class Collector {
   figures in this README are x86 numbers and say so.
 - **`shutdown()` must not race with active instrumentation.** Retired rings are held
   until the `Collector` is destroyed, so a stamp in flight across `shutdown()` is safe;
-  one in flight across `~Collector` is not.
+  one in flight across `~Collector` is not. A shared ring is the exception: restarting on
+  the same `shm_name` frees the retired one first, since it would otherwise keep the name
+  and the new session would open the old segment (throwing on a changed
+  `queue_capacity`). Only a stamp still in flight across that whole restart is exposed.
 - **Percentiles are approximate**, with a bounded relative error of ~3% at the default
   histogram precision. They are clamped to the observed `[min, max]`. Buckets are
   64-bit, so a single hot stage cannot wrap one and corrupt its percentiles however long

@@ -371,8 +371,14 @@ public:
         // Collector is destroyed costs one allocation per start/shutdown cycle
         // and removes the common case of that race. A stamp still in flight
         // when ~Collector runs remains the caller's responsibility to avoid.
+        //
+        // A shared ring is also remembered by name, because a retired one keeps
+        // its segment - and so its name - alive; open_transport() lets it go
+        // when a later session wants that name back.
         if (ring_) {
-            retired_rings_.push_back(std::move(ring_));
+            retired_rings_.push_back({std::move(ring_), cfg_.run_mode == mode::local
+                                                            ? std::string{}
+                                                            : cfg_.shm_name});
         }
         control_.reset();
 
@@ -633,6 +639,10 @@ private:
         // have to stay spelled the same way.
         const std::string meta = cfg_.shm_name + SLICK_PERFMON_META_SUFFIX;
 
+        if (cfg_.run_mode != mode::local) {
+            release_retired_ring(cfg_.shm_name);
+        }
+
         switch (cfg_.run_mode) {
         case mode::local:
             ring_ = std::make_unique<sample_queue>(cfg_.queue_capacity);
@@ -662,6 +672,30 @@ private:
             return control_.attach_shared(meta, cfg_.max_names);
         }
         return false;
+    }
+
+    /**
+     * @brief Free a retired ring that still holds the segment @p name.
+     *
+     * A retired shared ring keeps its segment mapped, and a mapped segment
+     * keeps its name: on Windows for as long as any handle is open, on POSIX
+     * until the owner unlinks it on destruction. Opening that name again would
+     * attach this session to the previous session's segment instead of
+     * creating its own - silently with the old capacity, or with a size
+     * mismatch thrown when the capacity changed, and an attach-only producer
+     * would find a "collector" that is only its own leftover.
+     *
+     * Freeing it reopens the race retirement exists for, but only for a stamp
+     * that loaded the pointer before shutdown() detached it and is still
+     * inside stamp() after the collector thread was joined and a new start()
+     * got this far. Retirement guards the nanoseconds after a detach; that
+     * window is not one of them.
+     */
+    void release_retired_ring(const std::string& name) {
+        retired_rings_.erase(
+            std::remove_if(retired_rings_.begin(), retired_rings_.end(),
+                           [&](const RetiredRing& r) { return r.shm_name == name; }),
+            retired_rings_.end());
     }
 
     // ------------------------------------------------------------------
@@ -1505,8 +1539,15 @@ private:
     detail::tsc_clock clock_;
     Pairer            pairer_;
 
-    std::unique_ptr<sample_queue>              ring_;
-    std::vector<std::unique_ptr<sample_queue>> retired_rings_;
+    /// A ring shutdown() could not free. shm_name is empty for a local ring,
+    /// which holds no name anyone could ask for again.
+    struct RetiredRing {
+        std::unique_ptr<sample_queue> ring;
+        std::string                   shm_name;
+    };
+
+    std::unique_ptr<sample_queue> ring_;
+    std::vector<RetiredRing>      retired_rings_;
 
     std::thread           thread_;
     std::atomic<bool>     running_{false};

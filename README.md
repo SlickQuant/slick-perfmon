@@ -495,7 +495,10 @@ its own calibration. Every latency column carries `config::output_unit` in its n
 (`_ns`, `_us` or `_cycles`) — the values stay bare numbers that load without parsing,
 but no reader can take one scale for another. With `config::subtract_overhead` on there
 is one further column, `overhead_<unit>`, holding the per-stamp cost that was taken out
-of every figure in the row, so a reader can put it back.
+of every figure in the row, so a reader can put it back. Numbers are always written in
+the classic `"C"` locale — a `.` decimal point and no digit grouping — whatever global
+locale the process sets, so a German or French desktop cannot put a stray comma in a row.
+The summary file follows the same rule; `dump_summary()` leaves a caller's stream as it is.
 
 Restarting a collector appends rather than starting over — but only onto a matching
 schema. The percentile list decides which columns exist; the unit and the overhead

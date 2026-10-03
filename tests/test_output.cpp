@@ -13,8 +13,11 @@
 
 #include <algorithm>
 #include <chrono>
+#include <clocale>
 #include <cstdio>
 #include <fstream>
+#include <iomanip>
+#include <locale>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -1039,4 +1042,127 @@ TEST(Output, PercentilesTooCloseToPrintAreStillDifferentColumns) {
         EXPECT_TRUE(c.start(session(99.9999999)));
         c.shutdown();
     }
+}
+
+namespace {
+
+/// A German-style numpunct: ',' for the decimal point, '.' grouping by three.
+/// Built from a facet rather than by name so the test runs on any machine,
+/// whichever locales it happens to have installed.
+struct comma_decimal : std::numpunct<char> {
+    char        do_decimal_point() const override { return ','; }
+    char        do_thousands_sep() const override { return '.'; }
+    std::string do_grouping() const override { return "\3"; }
+};
+
+/// Swaps the global C++ locale for the scope and puts the old one back, so a
+/// failing assertion cannot leak a comma locale into every later test.
+struct global_locale_guard {
+    std::locale previous;
+    explicit global_locale_guard(const std::locale& next) : previous(std::locale::global(next)) {}
+    ~global_locale_guard() { std::locale::global(previous); }
+};
+
+/// The same for the C locale's LC_NUMERIC, which snprintf follows.
+struct c_numeric_guard {
+    std::string previous;
+    bool        active = false;
+
+    c_numeric_guard() : previous(std::setlocale(LC_NUMERIC, nullptr)) {
+        for (const char* name : {"de_DE.UTF-8", "de_DE.utf8", "de_DE", "German_Germany.1252",
+                                 "de-DE", "fr_FR.UTF-8", "fr_FR"}) {
+            if (std::setlocale(LC_NUMERIC, name) != nullptr) {
+                active = true;
+                return;
+            }
+        }
+    }
+    ~c_numeric_guard() { std::setlocale(LC_NUMERIC, previous.c_str()); }
+};
+
+/// Whether `field` is one complete number in the classic locale.
+bool parses_as_number(const std::string& field) {
+    std::istringstream is(field);
+    is.imbue(std::locale::classic());
+    double v = 0.0;
+    is >> v;
+    return !is.fail() && is.peek() == std::char_traits<char>::eof();
+}
+
+}  // namespace
+
+TEST(Output, CsvNumbersIgnoreTheGlobalLocale) {
+    // Regression: the CSV stream took the process's global locale, so under a
+    // decimal-comma, digit-grouping locale a mean came out as 581,1 and tsc_hz
+    // as 3.293.886.887 - extra separators that shift every later column. The
+    // header was already locale-proof; the rows under it were not.
+    TempFiles files("locale");
+
+    // Before the Collector exists: its stream member takes the global locale
+    // at construction, which is the moment a real program would have set one.
+    const global_locale_guard guard(std::locale(std::locale::classic(), new comma_decimal));
+
+    // The facet is in force, or the test proves nothing.
+    {
+        std::ostringstream probe;
+        probe << std::fixed << std::setprecision(1) << 1234.5;
+        ASSERT_EQ(probe.str(), "1.234,5");
+    }
+
+    Collector c;
+    config    cfg    = quiet_config();
+    cfg.point_count  = static_cast<point_id>(pt::count);
+    cfg.name_of      = &names;
+    cfg.path         = files.csv;
+    cfg.summary_path = files.summary;
+    ASSERT_TRUE(c.start(cfg));
+    for (int i = 0; i < 2000; ++i) {
+        begin(pt::pipeline);
+        step(pt::pipeline, kMid);
+        end(pt::pipeline);
+    }
+    c.shutdown();
+
+    const auto lines = read_lines(files.csv);
+    ASSERT_GE(lines.size(), 2u);
+    const auto header = split_csv(lines[0]);
+    const size_t hz_col = column_of(header, "tsc_hz");
+    ASSERT_LT(hz_col, header.size());
+
+    for (size_t i = 1; i < lines.size(); ++i) {
+        const auto row = split_csv(lines[i]);
+        ASSERT_EQ(row.size(), header.size())
+            << "row " << i << " does not match the header width: " << lines[i];
+        // timestamp, point and stage are text; everything after them a number.
+        for (size_t col = 3; col < row.size(); ++col) {
+            EXPECT_TRUE(parses_as_number(row[col]))
+                << header[col] << " = '" << row[col] << "' in row " << i;
+        }
+        EXPECT_EQ(row[hz_col].find('.'), std::string::npos)
+            << "tsc_hz picked up a grouping separator: " << row[hz_col];
+    }
+
+    // The summary file is ours to format too: "tsc 2.9952 GHz", not "2,9952".
+    const auto summary = read_lines(files.summary);
+    ASSERT_FALSE(summary.empty());
+    EXPECT_EQ(summary[0].find(','), std::string::npos) << summary[0];
+}
+
+TEST(Output, SummaryDurationsIgnoreTheCLocale) {
+    // snprintf follows LC_NUMERIC, which a named std::locale::global() sets as
+    // a side effect, so the summary printed 1,5ns under a German locale even
+    // with its stream imbued. Skips where no comma locale is installed.
+    const c_numeric_guard guard;
+    if (!guard.active) {
+        GTEST_SKIP() << "no decimal-comma C locale installed";
+    }
+    char buf[16];
+    std::snprintf(buf, sizeof(buf), "%.1f", 1.5);
+    ASSERT_STREQ(buf, "1,5") << "the C locale is in force, or the test proves nothing";
+
+    EXPECT_EQ(detail::format_duration(1.5), "1.5ns");
+    EXPECT_EQ(detail::format_duration(2500.0), "2.50us");
+    EXPECT_EQ(detail::format_duration(3.25e6), "3.25ms");
+    EXPECT_EQ(detail::format_duration(4.5e9), "4.50s");
+    EXPECT_EQ(detail::format_fixed(1234.0, 0, "cyc"), "1234cyc");
 }

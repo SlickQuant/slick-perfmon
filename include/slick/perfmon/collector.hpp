@@ -231,20 +231,32 @@ constexpr bool has_anomaly(const stats& s) noexcept {
     return s.invalid != 0 || s.abandoned != 0 || s.orphan != 0 || s.out_of_range != 0;
 }
 
+/// Fixed-point `v` followed by `suffix`, always with a '.' for the decimal point.
+///
+/// Not snprintf: that follows the C locale, which a named std::locale::global()
+/// sets as well, and would turn the summary's 1.5ns into 1,5ns for whoever ran
+/// the process under a German locale. Summary-only, so the stream is no cost
+/// that matters.
+inline std::string format_fixed(double v, int precision, const char* suffix) {
+    std::ostringstream os;
+    os.imbue(std::locale::classic());
+    os << std::fixed << std::setprecision(precision) << v << suffix;
+    return os.str();
+}
+
 /// Render a duration with a unit suffix, for the human-readable summary only.
 /// The CSV stays unit-less numbers so it loads without parsing.
 inline std::string format_duration(double ns) {
-    char buf[32];
     if (ns < 1000.0) {
-        std::snprintf(buf, sizeof(buf), "%.1fns", ns);
-    } else if (ns < 1e6) {
-        std::snprintf(buf, sizeof(buf), "%.2fus", ns / 1e3);
-    } else if (ns < 1e9) {
-        std::snprintf(buf, sizeof(buf), "%.2fms", ns / 1e6);
-    } else {
-        std::snprintf(buf, sizeof(buf), "%.2fs", ns / 1e9);
+        return format_fixed(ns, 1, "ns");
     }
-    return buf;
+    if (ns < 1e6) {
+        return format_fixed(ns / 1e3, 2, "us");
+    }
+    if (ns < 1e9) {
+        return format_fixed(ns / 1e6, 2, "ms");
+    }
+    return format_fixed(ns / 1e9, 2, "s");
 }
 
 inline const char* env_or_null(const char* name) {
@@ -1322,6 +1334,12 @@ private:
         csv_buffer_.resize(64 * 1024);
         csv_.rdbuf()->pubsetbuf(csv_buffer_.data(),
                                 static_cast<std::streamsize>(csv_buffer_.size()));
+        // The stream was built with whatever global locale the process had at
+        // the time. A decimal comma or a grouping separator puts extra commas in
+        // a row - 581,1 or 3,293,886,887 - and shifts every later column, which
+        // no reader can tell from a real value. Before open(), so the filebuf
+        // never swaps its conversion facet with a file under it.
+        csv_.imbue(std::locale::classic());
         csv_.open(cfg_.path, std::ios::out | std::ios::app);
         if (!csv_.is_open()) {
             return;
@@ -1362,7 +1380,11 @@ private:
         if (cfg_.summary_path.empty()) {
             return;
         }
-        std::ofstream os(cfg_.summary_path, std::ios::out | std::ios::trunc);
+        // Classic for the same reason as the CSV, and before open() for the
+        // same reason. dump_summary() leaves a caller's stream as it found it.
+        std::ofstream os;
+        os.imbue(std::locale::classic());
+        os.open(cfg_.summary_path, std::ios::out | std::ios::trunc);
         if (!os.is_open()) {
             return;
         }
@@ -1432,9 +1454,7 @@ private:
 
     std::string unit_string(double v) const {
         if (cfg_.output_unit == unit::cycles) {
-            char buf[32];
-            std::snprintf(buf, sizeof(buf), "%.0fcyc", v);
-            return buf;
+            return detail::format_fixed(v, 0, "cyc");
         }
         const double ns = cfg_.output_unit == unit::microseconds ? v * 1000.0 : v;
         return detail::format_duration(ns);

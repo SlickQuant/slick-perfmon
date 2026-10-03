@@ -792,24 +792,32 @@ private:
             }
         }
 
-        while (drain_once()) {
-        }
+        final_drain();
         do_flush(std::chrono::steady_clock::now());
         flush_done_.store(flush_request_.load(std::memory_order_acquire), std::memory_order_release);
         write_summary_file();
     }
 
     bool drain_once() {
+        if (!drain_ready()) {
+            check_stall();
+            return false;
+        }
+        stalled_since_ = {};
+        return true;
+    }
+
+    /// One read from the cursor into the pairer. False means nothing is
+    /// published there yet - the ring is empty, or the cursor sits on a hole.
+    bool drain_ready() {
         uint64_t c = cursor_.load(std::memory_order_relaxed);
         auto [ptr, n] = ring_->read(c);
         cursor_.store(c, std::memory_order_release);
 
         if (ptr == nullptr || n == 0) {
-            check_stall();
             return false;
         }
 
-        stalled_since_ = {};
         for (uint32_t i = 0; i < n; ++i) {
             // Snapshot, not a reference into the ring. read() hands back a
             // pointer to live slot memory, and an overwriting ring means a
@@ -849,8 +857,58 @@ private:
             return;
         }
 
-        cursor_.store(cur + 1, std::memory_order_release);
+        skip_hole(cur);
+        stalled_since_ = {};
+    }
+
+    /// Abandon the unpublished reservation at @p cur and count it. Steps by a
+    /// whole control slot, the footprint of the smallest reserve(), so the
+    /// cursor lands on the next reservation rather than inside this one.
+    void skip_hole(uint64_t cur) {
+        cursor_.store(cur + ring_->items_per_slot(), std::memory_order_release);
         ++stalled_slots_;
+    }
+
+    /// Longest the final drain waits for a hole to be published before it
+    /// starts stepping over them. Long enough for a producer preempted between
+    /// reserve() and publish() to be rescheduled - a Windows quantum is
+    /// ~15.6 ms - and short enough that a dead one does not hold shutdown.
+    static constexpr std::chrono::milliseconds kFinalDrainGrace{100};
+
+    /**
+     * @brief Drain everything reserved before shutdown, holes included.
+     *
+     * Stopping at the first empty read, as the run loop may, would silently
+     * drop every event published behind an unpublished slot - and in the last
+     * drain there is no next poll to recover them. Instead the reservation
+     * cursor, sampled once on entry, says how much was reserved, and the drain
+     * keeps going until it has accounted for all of it.
+     *
+     * Bounded on both axes: holes get one shared grace period, the shorter of
+     * stalled_sample_timeout and kFinalDrainGrace, after which each is stepped
+     * over immediately and counted as a stalled slot; and the target is fixed,
+     * so a shared-memory producer still stamping cannot keep the drain alive.
+     * Anything already published past the target is still read on the way.
+     */
+    void final_drain() {
+        const uint64_t target = ring_->initial_reading_index();
+        const auto     deadline =
+            std::chrono::steady_clock::now() + (std::min)(cfg_.stalled_sample_timeout, kFinalDrainGrace);
+
+        while (true) {
+            if (drain_ready()) {
+                continue;
+            }
+            const uint64_t cur = cursor_.load(std::memory_order_relaxed);
+            if (cur >= target) {
+                break;
+            }
+            if (std::chrono::steady_clock::now() < deadline) {
+                std::this_thread::yield();
+                continue;
+            }
+            skip_hole(cur);
+        }
         stalled_since_ = {};
     }
 

@@ -12,6 +12,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <chrono>
 #include <limits>
 #include <stdexcept>
 #include <thread>
@@ -702,4 +703,37 @@ TEST(CollectorTest, NonFinitePercentilesAreRefused) {
     cfg.percentiles = {0.0, 50.0, 100.0};
     EXPECT_TRUE(c.start(cfg)) << "both ends of the range are valid";
     c.shutdown();
+}
+
+TEST(CollectorTest, ShutdownRecoversEventsPublishedBehindAHole) {
+    // Regression: the final drain stopped at its first empty read, so a slot
+    // reserved and never published - a producer killed between reserve() and
+    // publish() - silently swallowed everything published behind it. The span
+    // below never reached the pairer, the shutdown report had nothing in it,
+    // and the hole was not counted either: no loss anywhere in the output.
+    Collector c;
+    config    cfg   = quiet_config();
+    cfg.point_count = static_cast<point_id>(pt::count);
+    // Far beyond the test, so only the final drain can step over the hole -
+    // and must do so on its own, shorter, bound rather than this one.
+    cfg.stalled_sample_timeout = std::chrono::hours(1);
+    ASSERT_TRUE(c.start(cfg));
+
+    // Two holes, each with a span behind it: the grace is one shared bound,
+    // not one per hole, and stepping over the first must not end the drain.
+    ASSERT_NE(c.ring(), nullptr);
+    for (int i = 0; i < 2; ++i) {
+        (void)c.ring()->reserve(1);
+        begin(pt::work);
+        end(pt::work);
+    }
+
+    const auto t0 = std::chrono::steady_clock::now();
+    c.shutdown();
+    EXPECT_LT(std::chrono::steady_clock::now() - t0, std::chrono::seconds(5))
+        << "the hole must not hold shutdown for stalled_sample_timeout";
+
+    const stats s = c.snapshot_total(to_point(pt::work));
+    EXPECT_EQ(s.count, 2u) << "a span behind a hole was lost";
+    EXPECT_EQ(s.stalled, 2u) << "every skipped slot has to be reported";
 }

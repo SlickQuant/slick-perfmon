@@ -182,7 +182,7 @@ Everything else has a default that gives a working in-process session:
 | `poll_interval` | 1 ms | collector sleep once the ring is empty |
 | `csv_flush_interval` | 0 | 0 pushes the stream every interval; higher defers it |
 | `calibration_time` | 10 ms | TSC calibration window inside `start()` |
-| `stalled_sample_timeout` | 5 s | age at which an open span is abandoned and a ring hole stepped over |
+| `stalled_sample_timeout` | 5 s | age at which an open span is abandoned and a ring hole stepped over; at shutdown holes get at most 100 ms in total |
 | `queue_capacity` | 65536 | ring slots; must be a power of two |
 | `max_open_spans` | 4096 | concurrently open `(point, seq)` spans; a full table evicts |
 | `max_stages` | 1024 | distinct stage accumulators, and the bound on distinct points |
@@ -424,6 +424,12 @@ class Collector {
   `config::csv_flush_interval` defers it so the 64 KB buffer behind the stream can fill,
   at the price of a wider window in which a hard kill loses rows. `shutdown()` writes
   everything out either way.
+- **`shutdown()` drains everything reserved before it, holes included.** A slot a
+  producer reserved but never published — killed between `reserve()` and `publish()` —
+  does not end the final drain. Holes share one grace period (the shorter of
+  `stalled_sample_timeout` and 100 ms) to be published, after which each is stepped over
+  and counted in `stalled`, so the events behind them still reach the last report and the
+  loss is visible in it.
 - **Running at `max_open_spans` is a sustained cost, not a one-off.** Once the table is
   full it stays full — every `begin` evicts one span and inserts one — so eviction is on
   the critical path for as long as the overload lasts. It is amortised to ~1,500 cycles

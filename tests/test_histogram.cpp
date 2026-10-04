@@ -16,22 +16,26 @@ using namespace slick::perfmon;
 
 namespace {
 
-/// Exact percentile of a sorted sample, using the same "at least p% are <=
-/// this" rule the histogram implements, so a disagreement means the histogram
-/// is wrong rather than the two using different definitions.
+/// Exact percentile of a sample, straight from the definition the histogram
+/// documents: the smallest sample with at least p% of them at or below it.
+///
+/// Deliberately not a rank formula. It walks the sorted sample and tests the
+/// definition at each one, in integers - p is taken in thousandths of a
+/// percent, which every percentile used here is exactly - so it cannot share
+/// a rounding mistake with the histogram's own arithmetic.
 double exact_percentile(std::vector<uint64_t> v, double p) {
     std::sort(v.begin(), v.end());
     if (v.empty()) {
         return 0.0;
     }
-    auto rank = static_cast<size_t>((p / 100.0) * static_cast<double>(v.size()) + 0.5);
-    if (rank == 0) {
-        rank = 1;
+    const auto milli = static_cast<uint64_t>(std::llround(p * 1000.0));
+    const auto n     = static_cast<uint64_t>(v.size());
+    for (uint64_t at_or_below = 1; at_or_below <= n; ++at_or_below) {
+        if (at_or_below * 100'000 >= milli * n) {
+            return static_cast<double>(v[at_or_below - 1]);
+        }
     }
-    if (rank > v.size()) {
-        rank = v.size();
-    }
-    return static_cast<double>(v[rank - 1]);
+    return static_cast<double>(v.back());
 }
 
 void expect_within_error(double got, double expected) {
@@ -102,6 +106,48 @@ TEST(Histogram, EmptyHistogramReportsZeroRatherThanGarbage) {
     EXPECT_DOUBLE_EQ(h.percentile(50.0), 0.0);
     EXPECT_DOUBLE_EQ(h.percentile(0.0), 0.0);
     EXPECT_DOUBLE_EQ(h.percentile(100.0), 0.0);
+}
+
+TEST(Histogram, PercentileIsTheNearestRankNotTheRoundedOne) {
+    // Regression: the rank was p% of the count plus a half, truncated - a
+    // rounding, where the documented rule is a ceiling. On {1, 10000}, p51
+    // came out 1, though only 50% of the samples are at or below 1. Values
+    // under kSubBuckets have buckets of their own, so every expectation here
+    // is exact and worked out by hand rather than by a second formula.
+    Histogram two;
+    two.add(1);
+    two.add(10000);
+    EXPECT_DOUBLE_EQ(two.percentile(50.0), 1.0) << "exactly half are at or below 1";
+    expect_within_error(two.percentile(51.0), 10000.0);
+    expect_within_error(two.percentile(50.0001), 10000.0);
+
+    Histogram ten;  // 0..9, one each: p is "at least p% are <= this"
+    for (uint64_t v = 0; v < 10; ++v) {
+        ten.add(v);
+    }
+    EXPECT_DOUBLE_EQ(ten.percentile(10.0), 0.0);   // 1 of 10 at or below
+    EXPECT_DOUBLE_EQ(ten.percentile(10.1), 1.0);   // needs 2
+    EXPECT_DOUBLE_EQ(ten.percentile(50.1), 5.0);   // needs 6; rounding said 5th
+    EXPECT_DOUBLE_EQ(ten.percentile(90.0), 8.0);
+    EXPECT_DOUBLE_EQ(ten.percentile(90.0000001), 9.0);
+    EXPECT_DOUBLE_EQ(ten.percentile(0.0000001), 0.0);
+}
+
+TEST(Histogram, NearestRankIsExactWhereFloatingPointIsNot) {
+    // 99.9 x 1000 is 999.0000000000001 in double, so a ceil() of the product
+    // takes the rank one past where it belongs. Expectations are the exact
+    // rational ceil(p / 100 * n), computed outside this code.
+    EXPECT_EQ(Histogram::nearest_rank(99.9, 1000), 999u);
+    EXPECT_EQ(Histogram::nearest_rank(99.9, 41000), 40959u);
+    EXPECT_EQ(Histogram::nearest_rank(51.0, 2), 2u);
+    EXPECT_EQ(Histogram::nearest_rank(50.0, 2), 1u);
+    EXPECT_EQ(Histogram::nearest_rank(0.0000001, 5), 1u);
+
+    // Counts far past where a double holds p / 100 * n to the unit.
+    EXPECT_EQ(Histogram::nearest_rank(99.0, 9903509185699ull), 9804474093843ull);
+    EXPECT_EQ(Histogram::nearest_rank(99.99, 123456789012ull), 123444443334ull);
+    EXPECT_EQ(Histogram::nearest_rank(50.0, std::numeric_limits<uint64_t>::max()),
+              uint64_t{1} << 63);
 }
 
 TEST(Histogram, RecoversPercentilesOfAUniformDistribution) {

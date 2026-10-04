@@ -410,7 +410,9 @@ class Collector {
   and the new session would open the old segment (throwing on a changed
   `queue_capacity`). Only a stamp still in flight across that whole restart is exposed.
 - **Percentiles are approximate**, with a bounded relative error of ~3% at the default
-  histogram precision. They are clamped to the observed `[min, max]`. Buckets are
+  histogram precision. A percentile is the nearest rank - the smallest sample with at
+  least p% of them at or below it, with no interpolation - so `p51` of two samples is the
+  larger one. They are clamped to the observed `[min, max]`. Buckets are
   64-bit, so a single hot stage cannot wrap one and corrupt its percentiles however long
   the run lasts; the price is ~7.6 KB per histogram, two per stage, bounded by
   `config::max_stages` and paid entirely by the collector.
@@ -558,11 +560,11 @@ yours to partition.
 
 ```
 slick-perfmon summary   tsc 2.9952 GHz (invariant)   run 0:05:12   overhead 165 cyc/stamp   stalled 0 slot(s)
-point               stage                  count   dropped  abandoned    orphan  out_of_range         min        mean         p50         p99         max
----------------------------------------------------------------------------------------------------------------------------------------------------------
-tick_to_trade       decode               1204531         0          0         0             0      41.2ns      58.3ns      55.0ns     140.0ns      1.20us
-tick_to_trade       match                1204531         0          0         0             0      88.0ns     131.5ns     126.0ns     310.0ns      2.98us
-tick_to_trade       total                1204531         0          0         0             0     201.0ns     284.9ns     275.0ns     690.0ns      6.20us
+point               stage                  count   dropped   invalid  abandoned    orphan  out_of_range         min        mean         p50         p99         max
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------
+tick_to_trade       decode               1204531         0         0          0         0             0      41.2ns      58.3ns      55.0ns     140.0ns      1.20us
+tick_to_trade       match                1204531         0         0          0         0             0      88.0ns     131.5ns     126.0ns     310.0ns      2.98us
+tick_to_trade       total                1204531         0         0          0         0             0     201.0ns     284.9ns     275.0ns     690.0ns      6.20us
 ```
 
 ## Measured overhead

@@ -824,6 +824,66 @@ TEST(Output, AnomalyCountsWithNoSamplesBehindThemStillReachTheFile) {
     EXPECT_TRUE(in_summary) << "the summary must show a point that only had anomalies";
 }
 
+TEST(Output, TheSummaryShowsASpanDiscardedAsInvalid) {
+    // Regression: the summary printed every point anomaly except `invalid`. A
+    // span whose clock ran backwards is discarded whole, so a point with
+    // nothing else wrong showed up as a zero-count row with every counter on it
+    // at zero - the one row in the summary that explained nothing.
+    TempFiles files("invalid_only");
+
+    Collector c;
+    config    cfg      = quiet_config();
+    cfg.point_count    = static_cast<point_id>(pt::count);
+    cfg.name_of        = &names;
+    cfg.summary_path   = files.summary;
+    cfg.flush_interval = std::chrono::seconds(60);  // one flush, at shutdown
+    ASSERT_TRUE(c.start(cfg));
+    ASSERT_NE(c.ring(), nullptr);
+
+    // Written straight into the ring, because a real stamp reads the TSC and
+    // cannot be made to go backwards: an end stamped before its own begin.
+    const auto publish = [&](uint64_t tsc, uint8_t step) {
+        sample_queue&  q    = *c.ring();
+        const uint64_t slot = q.reserve();
+        q[slot]->store(tsc, static_cast<point_id>(pt::pipeline), make_event(step));
+        q.publish(slot);
+    };
+    publish(5000, kBeginStep);
+    publish(4000, kEndStep);
+    c.shutdown();
+
+    // Fixed-width columns, and no name here has a space in it, so a
+    // whitespace split lines each row up with the header.
+    const auto words = [](const std::string& line) {
+        std::istringstream       in(line);
+        std::vector<std::string> out;
+        for (std::string w; in >> w;) {
+            out.push_back(w);
+        }
+        return out;
+    };
+    const auto lines = read_lines(files.summary);
+    ASSERT_GE(lines.size(), 2u);
+    const auto header    = words(lines[1]);
+    const auto c_count   = std::find(header.begin(), header.end(), "count") - header.begin();
+    const auto c_invalid = std::find(header.begin(), header.end(), "invalid") - header.begin();
+    ASSERT_LT(c_invalid, static_cast<std::ptrdiff_t>(header.size()))
+        << "the summary has no invalid column";
+
+    bool found = false;
+    for (const std::string& line : lines) {
+        const auto row = words(line);
+        if (row.empty() || row[0] != "pipeline") {
+            continue;
+        }
+        ASSERT_EQ(row.size(), header.size()) << line;
+        found = true;
+        EXPECT_EQ(row[c_count], "0") << "the span was discarded, not completed";
+        EXPECT_EQ(row[c_invalid], "1") << line;
+    }
+    EXPECT_TRUE(found) << "a point whose only anomaly is invalid must still be shown";
+}
+
 TEST(Output, AnAnomalyIsWrittenOnceAndNotOnEveryLaterInterval) {
     // The pairer's counters are lifetime totals. Written straight into every
     // interval's row they would repeat for the rest of the run - noise, and a

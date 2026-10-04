@@ -102,6 +102,10 @@ public:
     /**
      * @brief Value at the given percentile, in the same unit as add().
      *
+     * Nearest rank: the bucket holding the smallest sample with at least p% of
+     * them at or below it - see nearest_rank(). No interpolation, so with two
+     * samples everything above p50 is the larger one.
+     *
      * @param p percentile in [0, 100]. Returns 0 for an empty histogram - a
      *          caller reporting stats always checks count first. Outside the
      *          range, and for a value that is not a number at all, the nearer
@@ -128,11 +132,7 @@ public:
             return static_cast<double>(bucket_midpoint(last_used()));
         }
 
-        // Rank of the sample we want, 1-based. ceil() so p = 50 on two samples
-        // picks the second, matching the usual "at least p% are <= this" rule.
-        const uint64_t rank = static_cast<uint64_t>(
-            (p / 100.0) * static_cast<double>(total_) + 0.5);
-        const uint64_t want = rank == 0 ? 1 : rank;
+        const uint64_t want = nearest_rank(p, total_);
 
         uint64_t seen = 0;
         for (uint32_t i = used_lo_; i <= used_hi_; ++i) {
@@ -142,6 +142,31 @@ public:
             }
         }
         return static_cast<double>(bucket_midpoint(last_used()));
+    }
+
+    /// Resolution of nearest_rank(): one part in this many of the whole
+    /// population, i.e. a percentile to seven decimal places.
+    static constexpr uint64_t kRankScale = 1'000'000'000;
+
+    /**
+     * @brief The nearest-rank definition: the 1-based rank of the smallest
+     *        sample with at least p% of the population at or below it,
+     *        ceil(p / 100 * n), and never below 1.
+     *
+     * For p in (0, 100) and n >= 1. Integer arithmetic rather than a ceil() of
+     * the floating-point product, which cannot be trusted at the one place the
+     * definition is sharp: 99.9 x 1000 comes out 999.0000000000001, and a
+     * ceil() of that takes the rank one past 999. So p is fixed to
+     * 1 / kRankScale of the whole once, and the product is split on n so that
+     * it is exact over every count a uint64_t can hold.
+     */
+    static uint64_t nearest_rank(double p, uint64_t n) noexcept {
+        const auto     scaled = static_cast<uint64_t>(p * (kRankScale / 100) + 0.5);
+        const uint64_t q      = n / kRankScale;
+        const uint64_t r      = n % kRankScale;
+        // q * scaled <= n, and r * scaled < kRankScale^2 < 2^64: neither wraps.
+        const uint64_t rank = q * scaled + (r * scaled + kRankScale - 1) / kRankScale;
+        return rank == 0 ? 1 : rank;
     }
 
     /// Bucket index for a value. Exposed for tests; the mapping is the whole

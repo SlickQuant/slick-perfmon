@@ -1518,12 +1518,12 @@ private:
 
         // Summed rather than hardcoded: a column added without widening the rule
         // under it is the sort of thing nobody notices until the output is ugly.
-        constexpr int kRuleWidth = 20 + 16 + 12 + 10 + 11 + 10 + 14 + 12 + 12 + 12 + 12 + 12;
+        constexpr int kRuleWidth = 20 + 16 + 12 + 10 + 10 + 11 + 10 + 14 + 12 + 12 + 12 + 12 + 12;
 
         os << std::left << std::setw(20) << "point" << std::setw(16) << "stage"
            << std::right << std::setw(12) << "count" << std::setw(10) << "dropped"
-           << std::setw(11) << "abandoned" << std::setw(10) << "orphan"
-           << std::setw(14) << "out_of_range"
+           << std::setw(10) << "invalid" << std::setw(11) << "abandoned"
+           << std::setw(10) << "orphan" << std::setw(14) << "out_of_range"
            << std::setw(12) << "min" << std::setw(12) << "mean" << std::setw(12) << "p50"
            << std::setw(12) << "p99" << std::setw(12) << "max" << '\n';
         os << std::string(kRuleWidth, '-') << '\n';
@@ -1538,6 +1538,7 @@ private:
             os << std::left << std::setw(20) << r.point_name << std::setw(16) << r.stage_name
                << std::right << std::setw(12) << r.cumulative.count
                << std::setw(10) << r.cumulative.dropped
+               << std::setw(10) << r.cumulative.invalid
                << std::setw(11) << r.cumulative.abandoned
                << std::setw(10) << r.cumulative.orphan
                << std::setw(14) << r.cumulative.out_of_range

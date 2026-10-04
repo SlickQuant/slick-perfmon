@@ -53,6 +53,24 @@ target_link_libraries(slick-perfmon-test_disabled PRIVATE slick::perfmon GTest::
 target_compile_definitions(slick-perfmon-test_disabled PRIVATE SLICK_PERFMON_ENABLED=0)
 add_test(NAME slick-perfmon-test_disabled COMMAND slick-perfmon-test_disabled)
 
+# The installed package, from the outside: a fresh configure of this source
+# tree, installed with a non-default include directory, then a find_package()
+# consumer built against it. A compiler is only handed on for a single-config
+# generator; a Visual Studio one picks its own and warns at being told.
+set(slick_perfmon_package_args
+    -DSOURCE_DIR=${PROJECT_SOURCE_DIR}
+    -DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/package
+    -DGENERATOR=${CMAKE_GENERATOR}
+    -DPLATFORM=${CMAKE_GENERATOR_PLATFORM}
+    -DTOOLSET=${CMAKE_GENERATOR_TOOLSET})
+get_property(slick_perfmon_multi_config GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
+if(NOT slick_perfmon_multi_config)
+    list(APPEND slick_perfmon_package_args -DCXX_COMPILER=${CMAKE_CXX_COMPILER})
+endif()
+add_test(NAME slick-perfmon-package
+         COMMAND ${CMAKE_COMMAND} ${slick_perfmon_package_args}
+                 -P ${CMAKE_CURRENT_SOURCE_DIR}/package/check_install.cmake)
+
 if(SLICK_PERFMON_ENABLED)
     # These assert that measurement works, which it cannot when every stamp has
     # been compiled out. Registering them in a disabled build would turn a

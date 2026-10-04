@@ -76,9 +76,11 @@ configure_file(cmake/version.hpp.in
 add_library(slick-perfmon INTERFACE)
 add_library(slick::perfmon ALIAS slick-perfmon)
 
+# Build tree only. The installed path comes from install(TARGETS ... INCLUDES
+# DESTINATION) below, the same variable the headers are copied with, so the
+# exported target cannot point anywhere the headers did not go.
 target_include_directories(slick-perfmon INTERFACE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-    $<INSTALL_INTERFACE:include>
 )
 set_target_properties(slick-perfmon PROPERTIES EXPORT_NAME perfmon)
 
@@ -156,7 +158,9 @@ install(FILES
     DESTINATION lib/cmake/slick-perfmon
 )
 
-install(TARGETS slick-perfmon EXPORT slick-perfmonTargets)
+install(TARGETS slick-perfmon EXPORT slick-perfmonTargets
+    INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+)
 
 install(EXPORT slick-perfmonTargets
     FILE slick-perfmonTargets.cmake

@@ -1011,6 +1011,11 @@ private:
             // nothing at all. Moving would have thrown that storage away and
             // reallocated the whole set every interval.
             reports_.swap(build_rows_);
+            // stalled_slots_ belongs to the collector thread, which keeps
+            // stepping over holes between flushes. The summary header reads
+            // this copy instead, taken with the rows it heads, so the two
+            // always describe the same moment.
+            published_stalled_ = stalled_slots_;
         }
 
         pairer_.clear_intervals();
@@ -1503,7 +1508,7 @@ private:
            << overhead_cycles_.load(std::memory_order_acquire) << " cyc/stamp"
            // Collector-wide rather than per-stage, so it belongs in the header
            // instead of as a column repeating one number down every row.
-           << "   stalled " << stalled_slots_ << " slot(s)\n";
+           << "   stalled " << published_stalled_ << " slot(s)\n";
 
         if (!invariant) {
             os << "WARNING: this CPU has no invariant TSC. The counter changes rate with\n"
@@ -1621,6 +1626,7 @@ private:
 
     mutable std::mutex       report_mutex_;
     std::vector<StageReport> reports_;
+    uint64_t                 published_stalled_ = 0;  ///< stalled_slots_ as of reports_
 
     // Collector-thread scratch for the flush path. Kept as members rather than
     // built per flush so a steady-state interval allocates nothing: build_rows_

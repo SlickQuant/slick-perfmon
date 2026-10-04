@@ -12,6 +12,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <clocale>
 #include <cstdio>
@@ -410,6 +411,57 @@ TEST(Output, DumpSummaryWorksOnDemandWhileRunning) {
     EXPECT_NE(body.find("slick-perfmon summary"), std::string::npos);
     EXPECT_NE(body.find("pipeline"), std::string::npos);
     c.shutdown();
+}
+
+TEST(Output, DumpSummaryWhileTheCollectorStepsOverHoles) {
+    // Regression: the header's stall count was the collector thread's own
+    // counter, read with no synchronisation while check_stall() went on
+    // incrementing it - report_mutex_ guarded the rows, not that, and flush()
+    // does not pause the collector. A data race on every live dump_summary()
+    // during a stall; ThreadSanitizer reports it. The header now prints the
+    // count published with the rows, so it must also agree with them.
+    Collector c;
+    config    cfg              = quiet_config();
+    cfg.point_count            = static_cast<point_id>(pt::count);
+    cfg.name_of                = &names;
+    cfg.stalled_sample_timeout = std::chrono::milliseconds(1);
+    ASSERT_TRUE(c.start(cfg));
+    ASSERT_NE(c.ring(), nullptr);
+    begin(pt::pipeline);
+    end(pt::pipeline);
+
+    // Holes claimed and never published, spaced out so the collector steps
+    // over them one by one while the summaries below are being written.
+    constexpr uint64_t kHoles = 8;
+    std::atomic<bool>  done{false};
+    std::thread        producer([&] {
+        for (uint64_t i = 0; i < kHoles; ++i) {
+            (void)c.ring()->reserve(1);
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        done.store(true, std::memory_order_release);
+    });
+    while (!done.load(std::memory_order_acquire)) {
+        std::ostringstream os;
+        c.dump_summary(os);
+    }
+    producer.join();
+    c.shutdown();
+
+    std::ostringstream os;
+    c.dump_summary(os);
+    const std::string body = os.str();
+    const size_t      at   = body.find("stalled ");
+    ASSERT_NE(at, std::string::npos);
+    const uint64_t header = std::stoull(body.substr(at + 8));
+    EXPECT_EQ(header, kHoles) << "every skipped slot has to be reported";
+
+    const auto rows = c.reports();
+    const auto row  = std::find_if(rows.begin(), rows.end(), [](const StageReport& r) {
+        return r.from == kBeginStep && r.to == kBeginStep && r.cumulative.count != 0;
+    });
+    ASSERT_NE(row, rows.end());
+    EXPECT_EQ(header, row->cumulative.stalled) << "the header and its rows disagree";
 }
 
 TEST(Output, AnEmptyPathDisablesFileWritingEntirely) {

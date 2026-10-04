@@ -30,7 +30,7 @@ find_package(Threads REQUIRED)
 # two dependencies whose code it does not contain, contradicting the whole point
 # of the switch.
 if(SLICK_PERFMON_ENABLED)
-    find_package(slick-queue 2.0.0 CONFIG QUIET)
+    find_package(slick-queue 2.1.0 CONFIG QUIET)
     if (NOT slick-queue_FOUND)
         message(STATUS "Fetching slick-queue...")
         include(FetchContent)
@@ -38,7 +38,7 @@ if(SLICK_PERFMON_ENABLED)
         FetchContent_Declare(
             slick-queue
             GIT_REPOSITORY https://github.com/SlickQuant/slick-queue.git
-            GIT_TAG v2.0.0 # See https://github.com/SlickQuant/slick-queue/releases for latest version
+            GIT_TAG v2.1.0 # See https://github.com/SlickQuant/slick-queue/releases for latest version
         )
         FetchContent_MakeAvailable(slick-queue)
     else()

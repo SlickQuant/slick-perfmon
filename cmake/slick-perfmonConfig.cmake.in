@@ -15,7 +15,7 @@ find_dependency(Threads)
 # A disabled package contains no ring and no control block, so it must not make
 # its consumers go and install the two libraries that back them.
 if(slick-perfmon_ENABLED)
-    find_dependency(slick-queue 2.0.0 CONFIG)
+    find_dependency(slick-queue 2.1.0 CONFIG)
     find_dependency(slick-shm CONFIG)
 endif()
 

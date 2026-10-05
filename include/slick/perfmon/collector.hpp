@@ -74,6 +74,14 @@ struct StageReport {
     /// without colliding with somebody's real stage, and a collision here is
     /// two different things answering to one (point, from, to) key.
     bool overflow = false;
+
+    /// The whole run's p50 and p99, in config::output_unit - the two the
+    /// summary prints. Always those two, whatever config::percentiles holds:
+    /// taken from `cumulative.percentiles` where it has them and computed from
+    /// the histogram where it does not, so the columns never show a different
+    /// statistic under these labels.
+    double summary_p50 = 0.0;
+    double summary_p99 = 0.0;
 };
 
 namespace detail {
@@ -750,6 +758,8 @@ private:
         stage_names_.reset(cfg_.max_stages);
         row_points_.reset(cfg_.max_stages);
         point_baseline_.reset(cfg_.max_stages);
+        summary_p50_at_ = configured_index(50.0);
+        summary_p99_at_ = configured_index(99.0);
         cached_name_generation_ = control_.name_generation();
 
         run_start_ = std::chrono::steady_clock::now();
@@ -888,17 +898,25 @@ private:
      * stalled_sample_timeout and kFinalDrainGrace, after which each is stepped
      * over immediately and counted as a stalled slot; and the target is fixed,
      * so a shared-memory producer still stamping cannot keep the drain alive.
-     * Anything already published past the target is still read on the way.
+     *
+     * Which is why the target is tested before every read rather than only
+     * after an empty one. A producer in another process is not detached by
+     * shutdown(), and while it keeps publishing every read succeeds - checked
+     * only on an empty read, the target was never consulted and the drain ran
+     * for exactly as long as that producer did. Whatever a read past the target
+     * returns in the same batch is still paired; nothing after it is waited for.
      */
     void final_drain() {
         const uint64_t target = ring_->initial_reading_index();
         const auto     deadline =
             std::chrono::steady_clock::now() + (std::min)(cfg_.stalled_sample_timeout, kFinalDrainGrace);
 
-        while (true) {
+        while (cursor_.load(std::memory_order_relaxed) < target) {
             if (drain_ready()) {
                 continue;
             }
+            // Reloaded after the read, which owns the cursor: a hole is stepped
+            // over from wherever read() left it.
             const uint64_t cur = cursor_.load(std::memory_order_relaxed);
             if (cur >= target) {
                 break;
@@ -1085,6 +1103,7 @@ private:
                      new_stalled);
             g.interval.merge_into(g.cumulative);
             to_stats(r.cumulative, g.cumulative, an, last_loss_, stalled_slots_);
+            to_summary(r, g.cumulative);
 
             note_row(g.point, n - 1, r);
         });
@@ -1108,6 +1127,7 @@ private:
             r.overflow       = false;
             to_stats(r.interval, empty, delta, new_losses, new_stalled);
             to_stats(r.cumulative, empty, total, last_loss_, stalled_slots_);
+            to_summary(r, empty);
             return r;
         };
 
@@ -1234,6 +1254,33 @@ private:
         for (double p : cfg_.percentiles) {
             s.percentiles.push_back(convert(acc.percentile(p)));
         }
+    }
+
+    /// Where config::percentiles already holds exactly @p p, or kNotConfigured.
+    size_t configured_index(double p) const noexcept {
+        for (size_t i = 0; i < cfg_.percentiles.size(); ++i) {
+            if (cfg_.percentiles[i] == p) {
+                return i;
+            }
+        }
+        return kNotConfigured;
+    }
+
+    /**
+     * @brief The summary's p50 and p99 for a row whose cumulative stats are set.
+     *
+     * Copied from the row where config::percentiles has them - the default list
+     * does, so the usual flush pays nothing - and otherwise read off the
+     * histogram. Never the nearest configured one instead: under a `p50`
+     * heading, a p90 is not an approximation of the median but a different
+     * statistic, and nothing on the page would say so.
+     */
+    void to_summary(StageReport& r, const Accumulator& acc) const {
+        const std::vector<double>& have = r.cumulative.percentiles;
+        r.summary_p50 = summary_p50_at_ < have.size() ? have[summary_p50_at_]
+                                                       : convert(acc.percentile(50.0));
+        r.summary_p99 = summary_p99_at_ < have.size() ? have[summary_p99_at_]
+                                                       : convert(acc.percentile(99.0));
     }
 
     double convert(double cycles) const noexcept {
@@ -1544,8 +1591,8 @@ private:
                << std::setw(14) << r.cumulative.out_of_range
                << std::setw(12) << unit_string(r.cumulative.min)
                << std::setw(12) << unit_string(r.cumulative.mean)
-               << std::setw(12) << pick_percentile(r.cumulative, 50.0)
-               << std::setw(12) << pick_percentile(r.cumulative, 99.0)
+               << std::setw(12) << unit_string(r.summary_p50)
+               << std::setw(12) << unit_string(r.summary_p99)
                << std::setw(12) << unit_string(r.cumulative.max) << '\n';
         }
     }
@@ -1556,24 +1603,6 @@ private:
         }
         const double ns = cfg_.output_unit == unit::microseconds ? v * 1000.0 : v;
         return detail::format_duration(ns);
-    }
-
-    /// The summary shows p50 and p99 specifically; if the user configured a
-    /// different set, show the nearest one rather than a blank column.
-    std::string pick_percentile(const stats& s, double want) const {
-        if (s.percentiles.empty()) {
-            return "-";
-        }
-        size_t best  = 0;
-        double bestd = 1e18;
-        for (size_t i = 0; i < cfg_.percentiles.size() && i < s.percentiles.size(); ++i) {
-            const double d = std::abs(cfg_.percentiles[i] - want);
-            if (d < bestd) {
-                bestd = d;
-                best  = i;
-            }
-        }
-        return unit_string(s.percentiles[best]);
     }
 
     // ------------------------------------------------------------------
@@ -1654,6 +1683,12 @@ private:
     PointAnomalies                    overflow_baseline_;
     uint64_t                          reported_stalled_ = 0;
 
+    /// Positions of 50 and 99 in config::percentiles, so to_summary() copies
+    /// rather than recomputes them; kNotConfigured where the list lacks one.
+    static constexpr size_t kNotConfigured = static_cast<size_t>(-1);
+    size_t                            summary_p50_at_ = kNotConfigured;
+    size_t                            summary_p99_at_ = kNotConfigured;
+
     /// Scratch for the collector-wide row write_csv() falls back to. A member
     /// for the same reason the rows are: it keeps the percentile vector it
     /// allocated the first time it was needed.
@@ -1720,6 +1755,8 @@ struct StageReport {
     stats       cumulative;
     bool        anomalies_only = false;
     bool        overflow       = false;
+    double      summary_p50    = 0.0;
+    double      summary_p99    = 0.0;
 };
 
 /// Stub with the same surface, so instrumented code and its setup compile

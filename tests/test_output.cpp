@@ -15,6 +15,7 @@
 #include <atomic>
 #include <chrono>
 #include <clocale>
+#include <cmath>
 #include <cstdio>
 #include <fstream>
 #include <iomanip>
@@ -76,6 +77,28 @@ std::vector<std::string> read_lines(const std::string& path) {
         }
     }
     return lines;
+}
+
+/// The fields of a summary line. Its columns are fixed-width and no name these
+/// tests use has a space in it, so a whitespace split lines each row up with
+/// the header.
+std::vector<std::string> words(const std::string& line) {
+    std::istringstream       in(line);
+    std::vector<std::string> out;
+    for (std::string w; in >> w;) {
+        out.push_back(w);
+    }
+    return out;
+}
+
+/// Publish one sample with a chosen timestamp straight into the collector's
+/// ring - what a real stamp does, minus reading the TSC, which a test needs to
+/// control to know what the statistics must come out as.
+void publish_raw(Collector& c, uint64_t tsc, uint8_t step) {
+    sample_queue&  q    = *c.ring();
+    const uint64_t slot = q.reserve();
+    q[slot]->store(tsc, static_cast<point_id>(pt::pipeline), make_event(step));
+    q.publish(slot);
 }
 
 /// Each test gets its own files, and removes them first so a previous run
@@ -842,26 +865,10 @@ TEST(Output, TheSummaryShowsASpanDiscardedAsInvalid) {
 
     // Written straight into the ring, because a real stamp reads the TSC and
     // cannot be made to go backwards: an end stamped before its own begin.
-    const auto publish = [&](uint64_t tsc, uint8_t step) {
-        sample_queue&  q    = *c.ring();
-        const uint64_t slot = q.reserve();
-        q[slot]->store(tsc, static_cast<point_id>(pt::pipeline), make_event(step));
-        q.publish(slot);
-    };
-    publish(5000, kBeginStep);
-    publish(4000, kEndStep);
+    publish_raw(c, 5000, kBeginStep);
+    publish_raw(c, 4000, kEndStep);
     c.shutdown();
 
-    // Fixed-width columns, and no name here has a space in it, so a
-    // whitespace split lines each row up with the header.
-    const auto words = [](const std::string& line) {
-        std::istringstream       in(line);
-        std::vector<std::string> out;
-        for (std::string w; in >> w;) {
-            out.push_back(w);
-        }
-        return out;
-    };
     const auto lines = read_lines(files.summary);
     ASSERT_GE(lines.size(), 2u);
     const auto header    = words(lines[1]);
@@ -882,6 +889,97 @@ TEST(Output, TheSummaryShowsASpanDiscardedAsInvalid) {
         EXPECT_EQ(row[c_invalid], "1") << line;
     }
     EXPECT_TRUE(found) << "a point whose only anomaly is invalid must still be shown";
+}
+
+TEST(Output, SummaryPercentilesAreTheOnesTheirHeadingsName) {
+    // Regression: the summary's p50 and p99 columns printed whichever
+    // configured percentile was nearest. With percentiles = {90} both showed
+    // the p90 - 912 cycles under "p50" for a median of 500 - and nothing on the
+    // page said so. They are now the real p50 and p99 whatever is configured.
+    TempFiles files("summary_percentiles");
+
+    Collector c;
+    config    cfg      = quiet_config();
+    cfg.point_count    = static_cast<point_id>(pt::count);
+    cfg.name_of        = &names;
+    cfg.summary_path   = files.summary;
+    cfg.output_unit    = unit::cycles;
+    cfg.percentiles    = {90.0};
+    cfg.flush_interval = std::chrono::seconds(60);  // one flush, at shutdown
+    ASSERT_TRUE(c.start(cfg));
+    ASSERT_NE(c.ring(), nullptr);
+
+    // 100 spans lasting 10, 20, ... 1000 cycles. By nearest rank the median is
+    // the 50th, 500 cycles; p90 is 900 and p99 is 990.
+    uint64_t tsc = 1'000'000;
+    for (uint64_t i = 1; i <= 100; ++i) {
+        publish_raw(c, tsc, kBeginStep);
+        tsc += i * 10;
+        publish_raw(c, tsc, kEndStep);
+        tsc += 1;
+    }
+    c.shutdown();
+
+    // The histogram reports a bucket midpoint, within kRelativeError of the
+    // value - nowhere near the neighbouring percentiles these are checked
+    // against.
+    const auto close_to = [](double got, double want) {
+        return std::abs(got - want) <= want * Histogram::kRelativeError;
+    };
+
+    const auto rows = c.reports();
+    const auto row  = std::find_if(rows.begin(), rows.end(), [](const StageReport& r) {
+        return r.cumulative.count != 0;
+    });
+    ASSERT_NE(row, rows.end());
+    ASSERT_EQ(row->cumulative.percentiles.size(), 1u);
+    EXPECT_TRUE(close_to(row->cumulative.percentiles[0], 900.0)) << row->cumulative.percentiles[0];
+    EXPECT_TRUE(close_to(row->summary_p50, 500.0)) << row->summary_p50;
+    EXPECT_TRUE(close_to(row->summary_p99, 990.0)) << row->summary_p99;
+
+    // And the file prints those, under those headings.
+    const auto lines = read_lines(files.summary);
+    ASSERT_GE(lines.size(), 2u);
+    const auto   header = words(lines[1]);
+    const size_t c_p50  = column_of(header, "p50");
+    const size_t c_p99  = column_of(header, "p99");
+    ASSERT_LT(c_p50, header.size());
+    ASSERT_LT(c_p99, header.size());
+    bool found = false;
+    for (const std::string& line : lines) {
+        const auto fields = words(line);
+        if (fields.empty() || fields[0] != "pipeline") {
+            continue;
+        }
+        ASSERT_EQ(fields.size(), header.size()) << line;
+        found = true;
+        EXPECT_TRUE(close_to(std::stod(fields[c_p50]), 500.0)) << line;  // "500cyc"
+        EXPECT_TRUE(close_to(std::stod(fields[c_p99]), 990.0)) << line;
+    }
+    EXPECT_TRUE(found);
+}
+
+TEST(Output, SummaryPercentilesReuseTheConfiguredOnes) {
+    // The default list has 50 and 99 in it, and then the summary's columns are
+    // exactly those values - copied, not computed a second time.
+    Collector c;
+    config    cfg   = quiet_config();
+    cfg.point_count = static_cast<point_id>(pt::count);
+    cfg.percentiles = {99.0, 50.0};  // out of order: found by value, not position
+    ASSERT_TRUE(c.start(cfg));
+    for (int i = 0; i < 1000; ++i) {
+        begin(pt::pipeline);
+        end(pt::pipeline);
+    }
+    const auto rows = c.reports();
+    c.shutdown();
+
+    ASSERT_FALSE(rows.empty());
+    for (const StageReport& r : rows) {
+        ASSERT_EQ(r.cumulative.percentiles.size(), 2u);
+        EXPECT_EQ(r.summary_p99, r.cumulative.percentiles[0]);
+        EXPECT_EQ(r.summary_p50, r.cumulative.percentiles[1]);
+    }
 }
 
 TEST(Output, AnAnomalyIsWrittenOnceAndNotOnEveryLaterInterval) {

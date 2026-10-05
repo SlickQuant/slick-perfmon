@@ -12,6 +12,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <limits>
 #include <stdexcept>
@@ -736,4 +737,55 @@ TEST(CollectorTest, ShutdownRecoversEventsPublishedBehindAHole) {
     const stats s = c.snapshot_total(to_point(pt::work));
     EXPECT_EQ(s.count, 2u) << "a span behind a hole was lost";
     EXPECT_EQ(s.stalled, 2u) << "every skipped slot has to be reported";
+}
+
+TEST(CollectorTest, ShutdownIsNotHeldByAProducerThatKeepsPublishing) {
+    // Regression: the final drain tested its fixed target only after an empty
+    // read. A producer in another process is not detached by shutdown(), and
+    // while one keeps the ring busy every read succeeds - so the target was
+    // never looked at, and shutdown() returned only once that producer
+    // stopped. Here a thread publishes straight into the ring, which is what
+    // such a producer does, and stops on its own long after the bound below.
+    Collector c;
+    config    cfg   = quiet_config();
+    cfg.point_count = static_cast<point_id>(pt::count);
+    ASSERT_TRUE(c.start(cfg));
+    sample_queue* q = c.ring();
+    ASSERT_NE(q, nullptr);
+
+    constexpr auto    kProducerRuns = std::chrono::seconds(5);
+    std::atomic<bool> stop{false};
+    std::atomic<bool> publishing{false};
+    std::thread       producer([&] {
+        const auto until = std::chrono::steady_clock::now() + kProducerRuns;
+        uint64_t   tsc   = 0;
+        const auto publish = [&](uint8_t step) {
+            const uint64_t slot = q->reserve();
+            (*q)[slot]->store(++tsc, to_point(pt::work), make_event(step));
+            q->publish(slot);
+        };
+        while (!stop.load(std::memory_order_relaxed) &&
+               std::chrono::steady_clock::now() < until) {
+            for (int i = 0; i < 256; ++i) {
+                publish(kBeginStep);
+                publish(kEndStep);
+            }
+            publishing.store(true, std::memory_order_release);
+        }
+    });
+    while (!publishing.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+
+    const auto t0 = std::chrono::steady_clock::now();
+    c.shutdown();
+    const auto took = std::chrono::steady_clock::now() - t0;
+
+    stop.store(true, std::memory_order_relaxed);
+    producer.join();  // before ~Collector frees the ring it is writing to
+
+    EXPECT_LT(took, std::chrono::seconds(1))
+        << "shutdown waited "
+        << std::chrono::duration_cast<std::chrono::milliseconds>(took).count()
+        << " ms for a producer that never stopped";
 }

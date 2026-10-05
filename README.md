@@ -567,6 +567,11 @@ tick_to_trade       match                1204531         0         0          0 
 tick_to_trade       total                1204531         0         0          0         0             0     201.0ns     284.9ns     275.0ns     690.0ns      6.20us
 ```
 
+The `p50` and `p99` columns are always the whole run's median and 99th percentile,
+whatever `percentiles` is set to: taken from the configured list when it has them and
+computed from the histogram when it does not. `StageReport::summary_p50` and
+`summary_p99` carry the same two values.
+
 ## Measured overhead
 
 From `bench/perfmon_bench` on an AMD Ryzen 9 5900HX (3.29 GHz TSC) running Windows,

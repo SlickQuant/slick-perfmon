@@ -1,5 +1,48 @@
 # Changelog
 
+## v0.2.0 - 10-04-2026
+
+### Changed
+
+- The summary table has an `invalid` column, after `dropped`, so every point anomaly
+  appears there. Anything reading the summary by column position sees the columns from
+  `invalid` onward move one place right; the CSV already had it and is unchanged.
+- The summary's `p50` and `p99` columns are always the run's real median and 99th
+  percentile, taken from `config::percentiles` when it has them and computed from the
+  histogram when it does not. `StageReport::summary_p50` and `summary_p99` carry them.
+- slick-queue 2.1.0 is now the minimum, for the build and for the installed package.
+
+### Fixed
+
+- Percentiles take the documented nearest rank, `ceil(p / 100 * n)`, instead of
+  rounding it: `p51` of `{1, 10000}` reported 1, though only half the samples are at or
+  below it. The rank is computed in integers, exactly, over every count a `uint64_t` can
+  hold — a floating-point `ceil()` would put `p99.9` of 1000 samples one rank too high.
+- The summary printed the nearest configured percentile under its fixed `p50` and `p99`
+  headings: with `percentiles = {90}` both columns showed the p90.
+- A span discarded for a backwards timestamp showed in the summary as a row of zeros,
+  because `invalid` was the one anomaly counter it did not print.
+- `shutdown()` stopped its final drain at the first unpublished slot, silently dropping
+  every event published behind it. It now drains everything reserved before it; holes
+  share one grace period, the shorter of `stalled_sample_timeout` and 100 ms, and are
+  then stepped over and counted in `stalled`.
+- A shared-memory producer that kept publishing held `shutdown()` open for as long as it
+  ran. The final drain now stops at what was reserved when shutdown began.
+- `dump_summary()` read the stall count while the collector thread was incrementing it,
+  a data race on every live call during a stall. The header now shows the count
+  published with the rows beneath it.
+- `dump_summary()` left the caller's stream in the summary's format — fixed notation,
+  four decimals, its own fill and alignment. The stream's format is now restored.
+- CSV and summary numbers follow the process's global locale no longer: a decimal comma
+  or digit grouping put extra separators in a CSV row. Both are written in the classic
+  locale; a stream passed to `dump_summary()` keeps its own.
+- Restarting a shared session on the same `shm_name` reopened the previous session's
+  segment, which the retired ring was still holding, and threw on a changed
+  `queue_capacity`. The retired ring is now freed first.
+- `cmake --install` with a custom `CMAKE_INSTALL_INCLUDEDIR` produced a package whose
+  exported target still pointed at `include`, so every consumer failed at generation.
+  The exported path now comes from the same variable the headers are installed with.
+
 ## v0.1.0 - 09-22-2026
 
 Initial release.

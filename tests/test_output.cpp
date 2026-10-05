@@ -436,6 +436,39 @@ TEST(Output, DumpSummaryWorksOnDemandWhileRunning) {
     c.shutdown();
 }
 
+TEST(Output, DumpSummaryLeavesTheCallersStreamFormatAlone) {
+    // Regression: the table switched the caller's stream to fixed notation with
+    // four decimals, and a fill and an alignment of its own, and left it that
+    // way - so whatever the caller printed after dump_summary(std::cout) came
+    // out in the summary's format instead of theirs.
+    Collector c;
+    config    cfg   = quiet_config();
+    cfg.point_count = static_cast<point_id>(pt::count);
+    cfg.name_of     = &names;
+    ASSERT_TRUE(c.start(cfg));
+    for (int i = 0; i < 100; ++i) {
+        begin(pt::pipeline);
+        end(pt::pipeline);
+    }
+
+    std::ostringstream os;
+    os << std::scientific << std::setprecision(2) << std::setfill('*') << std::left;
+    const std::ios_base::fmtflags flags = os.flags();
+
+    c.dump_summary(os);
+    c.shutdown();
+    ASSERT_NE(os.str().find("pipeline"), std::string::npos) << "the table was written";
+
+    EXPECT_EQ(os.flags(), flags);
+    EXPECT_EQ(os.precision(), 2);
+    EXPECT_EQ(os.fill(), '*');
+
+    // And what that means for the caller's next line.
+    os.str("");
+    os << std::setw(10) << 1.5;
+    EXPECT_EQ(os.str(), "1.50e+00**");
+}
+
 TEST(Output, DumpSummaryWhileTheCollectorStepsOverHoles) {
     // Regression: the header's stall count was the collector thread's own
     // counter, read with no synchronisation while check_stall() went on

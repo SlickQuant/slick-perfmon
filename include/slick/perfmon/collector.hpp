@@ -239,6 +239,27 @@ constexpr bool has_anomaly(const stats& s) noexcept {
     return s.invalid != 0 || s.abandoned != 0 || s.orphan != 0 || s.out_of_range != 0;
 }
 
+/// Restores a stream's format flags, precision and fill on scope exit - a
+/// throw from the stream included.
+class stream_format_guard {
+public:
+    explicit stream_format_guard(std::ostream& os)
+        : os_(os), flags_(os.flags()), precision_(os.precision()), fill_(os.fill()) {}
+    ~stream_format_guard() {
+        os_.flags(flags_);
+        os_.precision(precision_);
+        os_.fill(fill_);
+    }
+    stream_format_guard(const stream_format_guard&)            = delete;
+    stream_format_guard& operator=(const stream_format_guard&) = delete;
+
+private:
+    std::ostream&           os_;
+    std::ios_base::fmtflags flags_;
+    std::streamsize         precision_;
+    char                    fill_;
+};
+
 /// Fixed-point `v` followed by `suffix`, always with a '.' for the decimal point.
 ///
 /// Not snprintf: that follows the C locale, which a named std::locale::global()
@@ -468,9 +489,14 @@ public:
         return reports_;
     }
 
+    /// Writes the summary table to @p os, and leaves the stream as it found it:
+    /// the table sets fixed notation, a precision, a fill and an alignment as it
+    /// goes, and a caller printing to std::cout afterwards should not inherit
+    /// any of them. Its locale is never touched.
     void dump_summary(std::ostream& os) {
         flush();
-        std::lock_guard<std::mutex> lock(report_mutex_);
+        const detail::stream_format_guard keep(os);
+        std::lock_guard<std::mutex>       lock(report_mutex_);
         write_summary(os);
     }
 

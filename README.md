@@ -64,7 +64,7 @@ from the same events.
   is correct but roughly an order of magnitude more expensive, and the compiler says so.
 - An invariant TSC for trustworthy numbers. The library probes for one and shouts in the
   summary if it is missing.
-- [slick-queue](https://github.com/SlickQuant/slick-queue) 2.0.0 and
+- [slick-queue](https://github.com/SlickQuant/slick-queue) 2.1.0 and
   [slick-shm](https://github.com/SlickQuant/slick-shm) 0.1.6 — found with
   `find_package`, or fetched by the build if they are not installed
 
@@ -88,7 +88,7 @@ include(FetchContent)
 FetchContent_Declare(
     slick-perfmon
     GIT_REPOSITORY https://github.com/SlickQuant/slick-perfmon.git
-    GIT_TAG v0.1.0
+    GIT_TAG v0.2.0
 )
 FetchContent_MakeAvailable(slick-perfmon)
 target_link_libraries(main PRIVATE slick::perfmon)
@@ -125,6 +125,7 @@ function that turns a `(point, step)` pair into a label:
 enum class perf : slick::perfmon::point_id {
     tick_to_trade = 0,
     round_trip    = 1,
+    book_update   = 2,
     count
 };
 
@@ -262,7 +263,8 @@ If you get it wrong, you get `abandoned` counts rather than a plausible wrong nu
 ### Reading the results
 
 ```cpp
-auto& perfmon = slick::perfmon::collector::instance();
+using namespace slick::perfmon;                      // to_point, kBeginStep
+auto& perfmon = collector::instance();
 
 perfmon.flush();                                     // drain and publish a snapshot
 auto total = perfmon.snapshot_total(to_point(perf::tick_to_trade));
@@ -431,7 +433,9 @@ class Collector {
   does not end the final drain. Holes share one grace period (the shorter of
   `stalled_sample_timeout` and 100 ms) to be published, after which each is stepped over
   and counted in `stalled`, so the events behind them still reach the last report and the
-  loss is visible in it.
+  loss is visible in it. The drain stops at what was reserved when `shutdown()` began: a
+  producer in another process is not detached by it, and one that keeps publishing does
+  not hold shutdown open.
 - **Running at `max_open_spans` is a sustained cost, not a one-off.** Once the table is
   full it stays full — every `begin` evicts one span and inserts one — so eviction is on
   the critical path for as long as the overload lasts. It is amortised to ~1,500 cycles
@@ -469,8 +473,8 @@ each field lowers to the store instruction a plain assignment emitted. The only 
 given up is store merging across the two adjacent 32-bit fields, and the benchmark puts
 that inside the run-to-run noise.
 
-The collector's side of the same contract: `drain_once()` snapshots each slot into a
-local before pairing it, rather than handing the pairer a reference into live ring
+The collector's side of the same contract: the drain snapshots each slot into a local
+before pairing it, rather than handing the pairer a reference into live ring
 memory. The pairer reads `event`, `point` and `timestamp` several times each, and a
 producer lapping between two of those reads would otherwise let it pair a step from one
 generation against a timestamp from another.
@@ -677,6 +681,12 @@ Both feature switches are baked into the installed `Config.cmake` as the value t
 here, so a downstream `find_package` consumer cannot silently get a different build of
 the headers — and a disabled package does not make them install slick-queue or
 slick-shm.
+
+`cmake --install` honours `CMAKE_INSTALL_INCLUDEDIR`, and the exported `slick::perfmon`
+target points at wherever the headers went. The `slick-perfmon-package` test checks
+that end to end: it installs a fresh configure of the tree under a non-default include
+directory and builds a `find_package` consumer against it. Being a nested configure and
+build, it is the slowest test in the suite.
 
 Configuring with `-DSLICK_PERFMON_ENABLED=OFF` builds and tests the whole tree as well.
 The tests that assert measurement *works* are not registered in that configuration —

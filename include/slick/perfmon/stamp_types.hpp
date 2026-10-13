@@ -36,6 +36,17 @@ using span_seq = uint32_t;
 
 inline constexpr uint8_t  kBeginStep = 0x00;
 inline constexpr uint8_t  kEndStep   = 0xFF;
+
+/// Marks a value sample: a number recorded on its own, with no begin, no end
+/// and no timestamp. Not a boundary in any span, so it is reserved - the steps
+/// a span may use as intermediate boundaries are 0x01..kMaxSpanStep.
+///
+/// A step value rather than a bit elsewhere because nothing else in the record
+/// was free to give one up: a point_id is the user's whole 32 bits, a seq its
+/// whole 24, and the 64-bit slot has to hold a full-width value.
+inline constexpr uint8_t  kValueStep   = 0xFE;
+inline constexpr uint8_t  kMaxSpanStep = 0xFD;
+
 inline constexpr span_seq kNoSeq     = 0;
 inline constexpr span_seq kMaxSeq    = 0x00FFFFFFu;
 
@@ -52,22 +63,40 @@ constexpr uint8_t step_of(event_id e) noexcept { return static_cast<uint8_t>(e &
 
 constexpr span_seq seq_of(event_id e) noexcept { return e >> 8; }
 
+/// Whether an event is a value sample rather than a boundary in a span.
+constexpr bool is_value_event(event_id e) noexcept { return step_of(e) == kValueStep; }
+
 /**
- * @brief One timestamped event. Exactly 16 bytes, trivially copyable, and
- *        layout-stable across processes so it can live in shared memory.
+ * @brief One event. Exactly 16 bytes, trivially copyable, and layout-stable
+ *        across processes so it can live in shared memory.
  *
- * The timestamp stays a raw 64-bit TSC read: no delta, no unit conversion and
- * no saturation happen on the instrumented thread. That is what removes the
- * ~1.4 s ceiling a 32-bit cycle delta would have imposed, and it is why the
- * hot path has no arithmetic in it at all.
+ * Two kinds share the record, told apart by the step in `event`:
+ *
+ * - A stamp - begin, step or end - carries a timestamp. It stays a raw 64-bit
+ *   TSC read: no delta, no unit conversion and no saturation happen on the
+ *   instrumented thread. That is what removes the ~1.4 s ceiling a 32-bit
+ *   cycle delta would have imposed, and it is why the hot path has no
+ *   arithmetic in it at all.
+ * - A value sample (kValueStep) carries the value itself in the same 64 bits.
+ *   There is no span for it to belong to, so there is nothing to time and the
+ *   TSC is never read.
+ *
+ * One record for both rather than a second ring: a second ring would be a
+ * second pointer for the hot path to load and a second segment for every
+ * shared-memory peer to agree on, to carry sixteen bytes this one already has
+ * room for.
  *
  * The fields are plain scalars, but a sample that lives in the ring is only
  * ever touched through store() and load() below. See those for why.
  */
 struct alignas(16) sample {
-    uint64_t timestamp;   ///< raw TSC
+    uint64_t timestamp;   ///< raw TSC - or, in a value sample, the value
     point_id point;       ///< the user's measurement point
     event_id event;       ///< (seq << 8) | step
+
+    /// The payload of a value sample. The same 64 bits as `timestamp`, under
+    /// the name that says what they hold when is_value_event(event).
+    constexpr uint64_t value() const noexcept { return timestamp; }
 
     /**
      * @brief Write this sample into ring memory.

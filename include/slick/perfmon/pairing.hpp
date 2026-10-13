@@ -27,6 +27,14 @@ constexpr uint64_t total_key(point_id p) noexcept {
     return (static_cast<uint64_t>(p) << 16) | kTotalStagePair;
 }
 
+/// Whether a stage holds a point's value samples rather than a transition.
+/// (kValueStep, kValueStep) cannot collide with a real transition either:
+/// kValueStep is never a boundary in a span, so no transition starts or ends
+/// on it.
+constexpr bool is_value_stage(uint8_t from, uint8_t to) noexcept {
+    return from == kValueStep && to == kValueStep;
+}
+
 constexpr uint64_t span_key(point_id p, span_seq seq) noexcept {
     return (static_cast<uint64_t>(p) << 32) | (seq & kMaxSeq);
 }
@@ -63,8 +71,10 @@ constexpr PointAnomalies operator-(const PointAnomalies& a,
                           a.orphan - b.orphan, a.out_of_range - b.out_of_range};
 }
 
-/// One measured transition. `from`/`to` are kept so a row can be labelled
-/// without reversing the key.
+/// One measured transition - or one point's value samples, where `from` and
+/// `to` are both kValueStep and the accumulators hold the values as recorded
+/// rather than cycles. `from`/`to` are kept so a row can be labelled without
+/// reversing the key.
 struct Stage {
     point_id    point = 0;
     uint8_t     from  = 0;
@@ -118,7 +128,19 @@ public:
     void set_overhead(uint64_t cycles) noexcept { overhead_cycles_ = cycles; }
 
     void on_event(const sample& s) {
-        const uint8_t  st  = step_of(s.event);
+        const uint8_t st = step_of(s.event);
+
+        if (st == kValueStep) {
+            // A value sample is complete on its own: nothing to open, nothing
+            // to pair it with, and so nothing that can go wrong with it short
+            // of the stage table being full. Straight to its accumulator, as
+            // spanning zero stamp intervals: the overhead record() subtracts
+            // belongs to the interval between two stamps, and this is neither
+            // an interval nor in cycles.
+            record(s.point, kValueStep, kValueStep, s.value(), 0);
+            return;
+        }
+
         const span_seq sq  = seq_of(s.event);
         const uint64_t key = span_key(s.point, sq);
 
@@ -350,7 +372,8 @@ private:
 
     /// @param transitions how many stamp intervals `cycles` spans. One for a
     ///        stage; for the synthetic total, however many transitions the span
-    ///        actually made.
+    ///        actually made; none for a value sample, which is recorded as it
+    ///        came and is not in cycles at all.
     void record(point_id p, uint8_t from, uint8_t to, uint64_t cycles,
                 uint32_t transitions = 1) {
         // Subtracting the per-stamp overhead can only ever take a measurement

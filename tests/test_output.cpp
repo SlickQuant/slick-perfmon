@@ -118,6 +118,8 @@ struct TempFiles {
         std::remove(csv.c_str());
         std::remove(summary.c_str());
     }
+
+    void remove_csv() const { std::remove(csv.c_str()); }
 };
 
 }  // namespace
@@ -149,7 +151,8 @@ TEST(Output, WritesAHeaderAndOneRowPerStage) {
     EXPECT_EQ(header[0], "timestamp");
     EXPECT_EQ(header[1], "point");
     EXPECT_EQ(header[2], "stage");
-    EXPECT_EQ(header[3], "count");
+    EXPECT_EQ(header[3], "kind");
+    EXPECT_EQ(header[4], "count");
     EXPECT_EQ(header.back(), "tsc_hz");
 
     // "p99.9" has to become "p99_9", or the column name breaks a CSV reader
@@ -193,7 +196,9 @@ TEST(Output, CountsAccountForEverySpanStamped) {
     c.shutdown();
 
     const std::vector<std::string> lines  = read_lines(files.csv);
-    const std::vector<std::string> header = split(lines[0], ',');
+    const std::vector<std::string> header   = split(lines[0], ',');
+    const size_t                   count_at = column_of(header, "count");
+    ASSERT_LT(count_at, header.size());
 
     size_t   total_rows  = 0;
     uint64_t total_count = 0;
@@ -202,7 +207,7 @@ TEST(Output, CountsAccountForEverySpanStamped) {
         ASSERT_EQ(row.size(), header.size());
         if (row[2] == "total") {
             ++total_rows;
-            total_count += std::stoull(row[3]);
+            total_count += std::stoull(row[count_at]);
         }
     }
     EXPECT_EQ(total_rows, 1u) << "one flush should produce one total row";
@@ -1376,8 +1381,10 @@ TEST(Output, CsvNumbersIgnoreTheGlobalLocale) {
         const auto row = split_csv(lines[i]);
         ASSERT_EQ(row.size(), header.size())
             << "row " << i << " does not match the header width: " << lines[i];
-        // timestamp, point and stage are text; everything after them a number.
-        for (size_t col = 3; col < row.size(); ++col) {
+        // timestamp, point, stage and kind are text; everything after them a
+        // number.
+        ASSERT_EQ(header[3], "kind");
+        for (size_t col = 4; col < row.size(); ++col) {
             EXPECT_TRUE(parses_as_number(row[col]))
                 << header[col] << " = '" << row[col] << "' in row " << i;
         }
@@ -1408,4 +1415,356 @@ TEST(Output, SummaryDurationsIgnoreTheCLocale) {
     EXPECT_EQ(detail::format_duration(3.25e6), "3.25ms");
     EXPECT_EQ(detail::format_duration(4.5e9), "4.50s");
     EXPECT_EQ(detail::format_fixed(1234.0, 0, "cyc"), "1234cyc");
+}
+
+// --------------------------------------------------------------------------
+// Value samples. They share the latency rows' file and table, under the stage
+// name `value`, and their figures are the caller's own numbers: they reach
+// the outputs without the conversion every latency gets.
+// --------------------------------------------------------------------------
+
+namespace {
+
+constexpr point_id kDepth = 1;  // a value point, beside pt::pipeline
+
+constexpr std::string_view value_names(point_id p, uint8_t step) noexcept {
+    if (p == kDepth) {
+        return step == kBeginStep ? "queue_depth" : std::string_view{};
+    }
+    return names(p, step);
+}
+
+/// A session with one span point and one value point.
+config value_session(const TempFiles& files) {
+    config cfg       = quiet_config();
+    cfg.point_count  = 2;
+    cfg.name_of      = &value_names;
+    cfg.path         = files.csv;
+    cfg.summary_path = "";
+    return cfg;
+}
+
+}  // namespace
+
+TEST(Output, ValueSamplesAreRowsOfTheSameFileAsRecorded) {
+    TempFiles files("values");
+
+    Collector    c;
+    const config cfg = value_session(files);
+    ASSERT_TRUE(c.start(cfg));
+
+    constexpr int kSamples = 400;
+    for (int i = 0; i < kSamples; ++i) {
+        begin(pt::pipeline);
+        end(pt::pipeline);
+        value(kDepth, static_cast<uint64_t>(10 + i % 10));  // 10..19
+    }
+    c.shutdown();
+
+    const std::vector<std::string> lines = read_lines(files.csv);
+    ASSERT_GE(lines.size(), 3u) << "a header, a latency row and a value row at least";
+
+    // One file and one schema, whether or not a session records a value: every
+    // row says which kind it is, so the two never need different columns.
+    EXPECT_EQ(lines[0], detail::csv_header(cfg.percentiles, cfg.output_unit, false));
+
+    const std::vector<std::string> header = split(lines[0], ',');
+    const size_t point_at = column_of(header, "point");
+    const size_t stage_at = column_of(header, "stage");
+    const size_t kind_at  = column_of(header, "kind");
+    const size_t count_at = column_of(header, "count");
+    const size_t min_at   = column_of(header, "min_ns");
+    const size_t mean_at  = column_of(header, "mean_ns");
+    const size_t max_at   = column_of(header, "max_ns");
+    ASSERT_LT(max_at, header.size());
+
+    uint64_t values = 0;
+    uint64_t spans  = 0;
+    for (size_t i = 1; i < lines.size(); ++i) {
+        const std::vector<std::string> row = split(lines[i], ',');
+        ASSERT_EQ(row.size(), header.size()) << "row " << i << ": " << lines[i];
+
+        if (row[kind_at] != "value") {
+            // The latency rows are untouched by any of this.
+            EXPECT_EQ(row[kind_at], "latency") << lines[i];
+            EXPECT_EQ(row[point_at], "pipeline") << lines[i];
+            EXPECT_EQ(row[stage_at], "total") << lines[i];
+            spans += std::stoull(row[count_at]);
+            continue;
+        }
+        EXPECT_EQ(row[point_at], "queue_depth") << lines[i];
+        EXPECT_EQ(row[stage_at], "value") << lines[i];
+        values += std::stoull(row[count_at]);
+
+        // As recorded. Run through the cycles-to-nanoseconds conversion a
+        // latency gets, 10 would have come out as about 3 on a 3 GHz machine.
+        EXPECT_GE(std::stod(row[min_at]), 10.0) << lines[i];
+        EXPECT_LE(std::stod(row[max_at]), 19.0) << lines[i];
+        EXPECT_GE(std::stod(row[mean_at]), 10.0) << lines[i];
+        EXPECT_LE(std::stod(row[mean_at]), 19.0) << lines[i];
+    }
+    EXPECT_EQ(values, static_cast<uint64_t>(kSamples))
+        << "every value recorded has to be in exactly one interval's row";
+    EXPECT_EQ(spans, static_cast<uint64_t>(kSamples));
+}
+
+TEST(Output, AValueRowSaysNothingWasSubtractedFromIt) {
+    // With the correction on, every row carries what was taken out of its
+    // figures. Nothing is taken out of a value - it is not an interval between
+    // two stamps - so its row has to say zero, and its figures have to be
+    // whole.
+    TempFiles files("values_overhead");
+
+    Collector c;
+    config    cfg         = value_session(files);
+    cfg.subtract_overhead = true;
+    ASSERT_TRUE(c.start(cfg));
+    for (int i = 0; i < 200; ++i) {
+        value(kDepth, 1000);
+    }
+    c.shutdown();
+
+    const std::vector<std::string> lines = read_lines(files.csv);
+    ASSERT_GE(lines.size(), 2u);
+    const std::vector<std::string> header = split(lines[0], ',');
+    const size_t stage_at    = column_of(header, "stage");
+    const size_t min_at      = column_of(header, "min_ns");
+    const size_t overhead_at = column_of(header, "overhead_ns");
+    ASSERT_LT(overhead_at, header.size());
+
+    for (size_t i = 1; i < lines.size(); ++i) {
+        const std::vector<std::string> row = split(lines[i], ',');
+        ASSERT_EQ(row.size(), header.size()) << lines[i];
+        ASSERT_EQ(row[stage_at], "value") << lines[i];
+        EXPECT_EQ(row[min_at], "1000.0") << lines[i];
+        EXPECT_EQ(row[overhead_at], "0.0") << lines[i];
+    }
+}
+
+TEST(Output, TheSummaryShowsAValueRowAsBareNumbers) {
+    Collector c;
+    config    cfg   = quiet_config();
+    cfg.point_count = 2;
+    cfg.name_of     = &value_names;
+    ASSERT_TRUE(c.start(cfg));
+
+    for (int i = 0; i < 100; ++i) {
+        begin(pt::pipeline);
+        end(pt::pipeline);
+    }
+    for (uint64_t v = 1; v <= 8; ++v) {
+        value(kDepth, v);
+    }
+
+    std::ostringstream os;
+    c.dump_summary(os);
+    c.shutdown();
+
+    std::vector<std::string> span_row;
+    std::vector<std::string> value_row;
+    std::istringstream       in(os.str());
+    for (std::string line; std::getline(in, line);) {
+        const std::vector<std::string> w = words(line);
+        if (w.size() > 1 && w[0] == "pipeline") {
+            span_row = w;
+        } else if (w.size() > 1 && w[0] == "queue_depth") {
+            value_row = w;
+        }
+    }
+
+    // point stage count dropped invalid abandoned orphan out_of_range, then
+    // min mean p50 p99 max - with no unit, because none applies. Values below
+    // 16 are counted exactly, so the percentiles are exact too.
+    const std::vector<std::string> want = {"queue_depth", "value", "8", "0", "0", "0", "0",
+                                           "0",           "1",     "4.50", "4", "8", "8"};
+    EXPECT_EQ(value_row, want) << os.str();
+
+    // The latency row beside it is still a duration.
+    ASSERT_EQ(span_row.size(), want.size()) << os.str();
+    EXPECT_EQ(span_row[1], "total");
+    EXPECT_EQ(span_row.back().back(), 's') << span_row.back();
+}
+
+namespace {
+
+/// A name table that calls a latency stage "value" - the label a value row is
+/// told apart by.
+constexpr std::string_view colliding_names(point_id p, uint8_t step) noexcept {
+    if (p == to_point(pt::pipeline) && step == kMid) {
+        return "value";
+    }
+    return value_names(p, step);
+}
+
+}  // namespace
+
+TEST(Output, ALatencyStageCannotTakeTheValueLabel) {
+    // Regression: stage labels come from name_of, which may return anything,
+    // and one that returned "value" put a latency stage in the file under the
+    // exact label that marks a value row. A reader filtering on `stage` - the
+    // documented way to keep the two apart - then took durations for raw
+    // values, with nothing in either row to say otherwise.
+    TempFiles files("values_label");
+
+    Collector c;
+    config    cfg = value_session(files);
+    cfg.name_of   = &colliding_names;
+    ASSERT_TRUE(c.start(cfg));
+
+    constexpr int kSamples = 200;
+    for (int i = 0; i < kSamples; ++i) {
+        begin(pt::pipeline);
+        step(pt::pipeline, kMid);
+        end(pt::pipeline);
+        value(kDepth, 1000);
+    }
+
+    // The latency stage falls back to the generated name, as an unnamed one
+    // would, and is not flagged as a value.
+    const std::string fallback =
+        "step_" + std::to_string(kBeginStep) + "->" + std::to_string(kMid);
+    const auto rows  = c.reports();
+    const auto stage = std::find_if(rows.begin(), rows.end(), [](const StageReport& r) {
+        return r.point == to_point(pt::pipeline) && r.from == kBeginStep && r.to == kMid;
+    });
+    ASSERT_NE(stage, rows.end());
+    EXPECT_FALSE(stage->value);
+    EXPECT_EQ(stage->stage_name, fallback);
+    EXPECT_EQ(stage->cumulative.count, static_cast<uint64_t>(kSamples));
+
+    std::ostringstream os;
+    c.dump_summary(os);
+    c.shutdown();
+
+    // In the file, the label now selects the value rows and nothing else.
+    const std::vector<std::string> lines = read_lines(files.csv);
+    ASSERT_GE(lines.size(), 2u);
+    const std::vector<std::string> header = split(lines[0], ',');
+    const size_t point_at = column_of(header, "point");
+    const size_t stage_at = column_of(header, "stage");
+    const size_t kind_at  = column_of(header, "kind");
+    const size_t count_at = column_of(header, "count");
+    const size_t min_at   = column_of(header, "min_ns");
+    ASSERT_LT(min_at, header.size());
+
+    uint64_t labelled = 0;
+    uint64_t renamed  = 0;
+    for (size_t i = 1; i < lines.size(); ++i) {
+        const std::vector<std::string> row = split(lines[i], ',');
+        ASSERT_EQ(row.size(), header.size()) << lines[i];
+        EXPECT_EQ(row[stage_at] == "value", row[kind_at] == "value")
+            << "the label and the kind column disagree: " << lines[i];
+        if (row[stage_at] == "value") {
+            EXPECT_EQ(row[point_at], "queue_depth") << lines[i];
+            EXPECT_EQ(row[min_at], "1000.0") << lines[i];
+            labelled += std::stoull(row[count_at]);
+        } else if (row[stage_at] == fallback) {
+            EXPECT_EQ(row[point_at], "pipeline") << lines[i];
+            renamed += std::stoull(row[count_at]);
+        }
+    }
+    EXPECT_EQ(labelled, static_cast<uint64_t>(kSamples))
+        << "the value label has to select every value sample and no latency";
+    EXPECT_EQ(renamed, static_cast<uint64_t>(kSamples))
+        << "the latency stage still has to be in the file, under the generated name";
+
+    // And the same in the summary: one row labelled value, and it is the
+    // value point's.
+    size_t             summary_rows = 0;
+    std::istringstream in(os.str());
+    for (std::string line; std::getline(in, line);) {
+        const std::vector<std::string> w = words(line);
+        if (w.size() > 1 && w[1] == "value") {
+            EXPECT_EQ(w[0], "queue_depth") << line;
+            ++summary_rows;
+        }
+    }
+    EXPECT_EQ(summary_rows, 1u) << os.str();
+}
+
+TEST(Output, AFileFromBeforeValueSamplesIsNotAppendedTo) {
+    // Regression: reserving the `value` stage label fixed new files and did
+    // nothing for old ones. A CSV written before value samples existed could
+    // already hold a latency stage called `value` - the label was anybody's
+    // then - and its header matched this version's, so a restart appended
+    // value rows beneath it: durations and raw numbers under one label, in one
+    // file, for good. The header now carries a `kind` column, so such a file
+    // no longer matches and is refused instead of extended.
+    TempFiles files("values_legacy");
+
+    // Exactly what the previous release wrote for the default configuration,
+    // with a latency stage its name_of had called `value`.
+    const std::string legacy_header =
+        "timestamp,point,stage,count,dropped,invalid,stalled,abandoned,orphan,"
+        "out_of_range,min_ns,mean_ns,stddev_ns,p50_ns,p90_ns,p99_ns,p99_9_ns,max_ns,tsc_hz";
+    const std::string legacy_row =
+        "2026-09-20 18:51:00.000,pipeline,value,200,0,0,0,0,0,0,"
+        "290.5,301.2,11.0,300.0,310.0,330.0,340.0,350.0,2995200000";
+    {
+        std::ofstream out(files.csv);
+        out << legacy_header << '\n' << legacy_row << '\n';
+    }
+    ASSERT_TRUE(detail::is_pre_kind_header(legacy_header));
+    ASSERT_FALSE(detail::is_pre_kind_header(detail::csv_header({50.0}, unit::nanoseconds, false)));
+
+    {
+        Collector c;
+        try {
+            (void)c.start(value_session(files));
+            ADD_FAILURE() << "a pre-kind file was accepted for appending";
+            c.shutdown();
+        } catch (const std::invalid_argument& e) {
+            // Named for what it is: the usual advice - restore the settings
+            // the file was written with - cannot make this file safe.
+            EXPECT_NE(std::string(e.what()).find("`kind`"), std::string::npos) << e.what();
+        }
+    }
+
+    const std::vector<std::string> untouched = read_lines(files.csv);
+    ASSERT_EQ(untouched.size(), 2u) << "the refused file was written to anyway";
+    EXPECT_EQ(untouched[0], legacy_header);
+    EXPECT_EQ(untouched[1], legacy_row);
+
+    // The refusal is for the old schema, not for value rows as such: a file
+    // this version wrote, value rows and all, is one it goes on appending to.
+    files.remove_csv();
+    for (int session = 0; session < 2; ++session) {
+        Collector c;
+        ASSERT_TRUE(c.start(value_session(files))) << "session " << session;
+        for (int i = 0; i < 50; ++i) {
+            value(kDepth, 3);
+        }
+        c.shutdown();
+    }
+    const std::vector<std::string> lines = read_lines(files.csv);
+    ASSERT_GE(lines.size(), 3u) << "a header and a row from each session";
+    EXPECT_EQ(std::count_if(lines.begin(), lines.end(),
+                            [](const std::string& l) { return l.rfind("timestamp,", 0) == 0; }),
+              1)
+        << "a restart continues the series, it does not re-head it";
+}
+
+TEST(Output, AWideValueDoesNotRunIntoItsNeighbourInTheSummary) {
+    // A duration never fills its twelve columns. A value is whatever the
+    // caller recorded, and twenty digits in a field padded to twelve would
+    // butt up against the figure before it and read as one number.
+    Collector c;
+    config    cfg   = quiet_config();
+    cfg.point_count = 2;
+    cfg.name_of     = &value_names;
+    ASSERT_TRUE(c.start(cfg));
+    value(kDepth, 12345678901234567890ull);
+    value(kDepth, 12345678901234567890ull);
+
+    std::ostringstream os;
+    c.dump_summary(os);
+    c.shutdown();
+
+    const std::string body = os.str();
+    const size_t      at   = body.find("queue_depth");
+    ASSERT_NE(at, std::string::npos) << body;
+    const std::vector<std::string> row = words(body.substr(at, body.find('\n', at) - at));
+    ASSERT_EQ(row.size(), 13u) << body;
+    EXPECT_EQ(row[8].size(), 20u) << "min: " << row[8];
+    EXPECT_EQ(row.back().size(), 20u) << "max: " << row.back();
 }

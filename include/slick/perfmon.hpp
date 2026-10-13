@@ -59,23 +59,35 @@ SLICK_PERFMON_FORCE_INLINE std::atomic<sample_queue*>& hot_ring() noexcept {
     return g_hot.ring;
 }
 
-/// The publish itself, against an explicit ring.
+/// Hand one record to the ring: reserve a slot, fill it, release it.
 ///
-/// Factored out so overhead calibration can drive the real code path against a
-/// private ring instead of re-implementing it - a calibration that measured a
-/// copy of this function would drift away from it at the first change, and it
-/// must not pollute the live ring with its own samples.
-template <bool IsBegin>
-SLICK_PERFMON_FORCE_INLINE void stamp_into(sample_queue& q, point_id p, event_id e) noexcept {
-    const uint64_t t = read_tsc<IsBegin>();
-
+/// What a stamp and a value sample have in common, which is everything but
+/// where the 64-bit payload comes from - so it is written once and both go
+/// through it.
+SLICK_PERFMON_FORCE_INLINE void publish_into(sample_queue& q, uint64_t payload, point_id p,
+                                             event_id e) noexcept {
     // reserve(1) cannot throw: it only rejects n == 0 or n > capacity, and the
     // collector validates capacity >= 2 before any ring reaches this function.
     const uint64_t slot = q.reserve();
     // Relaxed atomic stores, not plain ones: the ring overwrites, so this write
     // can overlap the collector reading the same slot. See sample::store().
-    q[slot]->store(t, p, e);
+    q[slot]->store(payload, p, e);
     q.publish(slot);
+}
+
+/// The stamp itself, against an explicit ring.
+///
+/// Factored out so overhead calibration can drive the real code path against a
+/// private ring instead of re-implementing it - a calibration that measured a
+/// copy of this function would drift away from it at the first change, and it
+/// must not pollute the live ring with its own samples.
+///
+/// The timestamp is an argument, so it is read before the slot is reserved:
+/// the reservation is the contended part, and it must not sit inside the
+/// interval being measured.
+template <bool IsBegin>
+SLICK_PERFMON_FORCE_INLINE void stamp_into(sample_queue& q, point_id p, event_id e) noexcept {
+    publish_into(q, read_tsc<IsBegin>(), p, e);
 }
 
 }  // namespace detail
@@ -109,7 +121,8 @@ SLICK_PERFMON_FORCE_INLINE void begin(T p, span_seq seq = kNoSeq) noexcept {
     stamp<true>(to_point(p), make_event(kBeginStep, seq));
 }
 
-/// Mark an intermediate boundary. Valid steps are 0x01..0xFE.
+/// Mark an intermediate boundary. Valid steps are 0x01..kMaxSpanStep (0xFD);
+/// 0xFE is kValueStep and would be read back as a value sample.
 template <point_like T>
 SLICK_PERFMON_FORCE_INLINE void step(T p, uint8_t n, span_seq seq = kNoSeq) noexcept {
     stamp<false>(to_point(p), make_event(n, seq));
@@ -119,6 +132,34 @@ SLICK_PERFMON_FORCE_INLINE void step(T p, uint8_t n, span_seq seq = kNoSeq) noex
 template <point_like T>
 SLICK_PERFMON_FORCE_INLINE void end(T p, span_seq seq = kNoSeq) noexcept {
     stamp<false>(to_point(p), make_event(kEndStep, seq));
+}
+
+/**
+ * @brief Record one value on a point: a queue depth, a batch size, a byte
+ *        count - a number that is a measurement in itself.
+ *
+ * There is no begin and no end. Every call is one complete sample, and the
+ * backend reports the distribution of the values a point was given: count,
+ * min, mean, stddev, percentiles and max, exactly as it does for a latency but
+ * in the caller's own unit, with no cycles-to-time conversion applied.
+ *
+ * Cheaper than a stamp, because the one expensive thing a stamp does is read a
+ * serialized TSC and a value has no use for one: this is the null check and
+ * the publish, with @p v stored where the timestamp would have gone.
+ *
+ * The value is an unsigned 64-bit integer. A negative number converts the way
+ * the language says it does and is reported as a very large one.
+ *
+ * A point takes values or spans, not both - the two would share a name in the
+ * output while meaning unrelated things.
+ */
+template <point_like T>
+SLICK_PERFMON_FORCE_INLINE void value(T p, uint64_t v) noexcept {
+    sample_queue* q = detail::hot_ring().load(std::memory_order_acquire);
+    if (q == nullptr) [[unlikely]] {
+        return;
+    }
+    detail::publish_into(*q, v, to_point(p), make_event(kValueStep));
 }
 
 /**
@@ -154,6 +195,9 @@ SLICK_PERFMON_FORCE_INLINE void step(T, uint8_t, span_seq = kNoSeq) noexcept {}
 
 template <point_like T>
 SLICK_PERFMON_FORCE_INLINE void end(T, span_seq = kNoSeq) noexcept {}
+
+template <point_like T>
+SLICK_PERFMON_FORCE_INLINE void value(T, uint64_t) noexcept {}
 
 inline void attach(sample_queue*) noexcept {}
 

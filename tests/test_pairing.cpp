@@ -396,3 +396,155 @@ TEST(Pairing, ResetClearsSessionCounters) {
     EXPECT_EQ(p.peak_open_spans(), 0u);
     EXPECT_EQ(p.overflow_anomalies().orphan, 0u);
 }
+
+// --------------------------------------------------------------------------
+// Value samples. No begin, no end and no timestamp: each event is one complete
+// measurement, so none of the span machinery above may touch it.
+// --------------------------------------------------------------------------
+
+TEST(Pairing, AValueSampleIsCompleteOnItsOwn) {
+    Pairer p = make_pairer();
+    p.on_event(ev(kPoint, kValueStep, 7));
+    p.on_event(ev(kPoint, kValueStep, 3));
+    p.on_event(ev(kPoint, kValueStep, 12));
+
+    Stage* v = find_stage(p, kPoint, kValueStep, kValueStep);
+    ASSERT_NE(v, nullptr);
+    EXPECT_TRUE(is_value_stage(v->from, v->to));
+    EXPECT_EQ(v->interval.count(), 3u);
+    EXPECT_EQ(v->interval.min(), 3u);
+    EXPECT_EQ(v->interval.max(), 12u);
+    EXPECT_DOUBLE_EQ(v->interval.mean(), 22.0 / 3.0);
+
+    // One accumulator for the point, and nothing else: no span was opened, so
+    // there is no total, nothing left open to age out, and nothing to report
+    // as having gone wrong.
+    EXPECT_EQ(stage_count(p), 1u);
+    EXPECT_EQ(find_total(p, kPoint), nullptr);
+    EXPECT_EQ(p.open_span_count(), 0u);
+    EXPECT_FALSE(any_anomaly(p.anomalies_of(kPoint)))
+        << "a value with no span open is not an orphan";
+}
+
+TEST(Pairing, AValueIsNeverCorrectedForStampOverhead) {
+    // The overhead is what a stamp adds to the interval between two stamps. A
+    // value is not an interval and is not in cycles, so subtracting it would
+    // turn a queue depth of 10 into zero.
+    Pairer p = make_pairer();
+    p.set_overhead(25);
+
+    p.on_event(ev(kPoint, kValueStep, 10));
+
+    Stage* v = find_stage(p, kPoint, kValueStep, kValueStep);
+    ASSERT_NE(v, nullptr);
+    EXPECT_EQ(v->interval.min(), 10u);
+    EXPECT_EQ(v->interval.max(), 10u);
+}
+
+TEST(Pairing, AValueDoesNotDisturbASpanOpenOnTheSamePoint) {
+    // The 64 bits of a value event hold the value, and here they are far below
+    // the span's timestamps. Read as a timestamp that is the clock running
+    // backwards, which would discard the span as `invalid`.
+    Pairer p = make_pairer();
+    p.on_event(ev(kPoint, kBeginStep, 1000));
+    p.on_event(ev(kPoint, kValueStep, 5));
+    p.on_event(ev(kPoint, kDecode, 1100));
+    p.on_event(ev(kPoint, kValueStep, 9));
+    p.on_event(ev(kPoint, kEndStep, 1600));
+
+    Stage* total = find_total(p, kPoint);
+    ASSERT_NE(total, nullptr);
+    EXPECT_EQ(total->interval.count(), 1u);
+    EXPECT_EQ(total->interval.min(), 600u);
+
+    Stage* decode = find_stage(p, kPoint, kBeginStep, kDecode);
+    ASSERT_NE(decode, nullptr);
+    EXPECT_EQ(decode->interval.min(), 100u);
+
+    // The span's own transitions are the ones it stamped: the value is not a
+    // boundary, so no stage starts or ends on it.
+    Stage* finish = find_stage(p, kPoint, kDecode, kEndStep);
+    ASSERT_NE(finish, nullptr);
+    EXPECT_EQ(finish->interval.min(), 500u);
+    EXPECT_EQ(find_stage(p, kPoint, kBeginStep, kValueStep), nullptr);
+    EXPECT_EQ(find_stage(p, kPoint, kValueStep, kDecode), nullptr);
+
+    Stage* v = find_stage(p, kPoint, kValueStep, kValueStep);
+    ASSERT_NE(v, nullptr);
+    EXPECT_EQ(v->interval.count(), 2u);
+
+    EXPECT_FALSE(any_anomaly(p.anomalies_of(kPoint)));
+    EXPECT_EQ(p.open_span_count(), 0u);
+}
+
+TEST(Pairing, AValueIgnoresTheSeqBits) {
+    // seq tells concurrent spans apart. A value belongs to no span, so two
+    // values on one point are two samples of one distribution whatever those
+    // bits hold - and neither may be left behind as an open span.
+    Pairer p = make_pairer();
+    p.on_event(ev(kPoint, kValueStep, 4, 77));
+    p.on_event(ev(kPoint, kValueStep, 6, 78));
+
+    EXPECT_EQ(stage_count(p), 1u);
+    Stage* v = find_stage(p, kPoint, kValueStep, kValueStep);
+    ASSERT_NE(v, nullptr);
+    EXPECT_EQ(v->interval.count(), 2u);
+    EXPECT_EQ(p.open_span_count(), 0u);
+}
+
+TEST(Pairing, ValuesOnDifferentPointsStaySeparate) {
+    Pairer p = make_pairer();
+    p.on_event(ev(1, kValueStep, 100));
+    p.on_event(ev(2, kValueStep, 200));
+
+    Stage* a = find_stage(p, 1, kValueStep, kValueStep);
+    Stage* b = find_stage(p, 2, kValueStep, kValueStep);
+    ASSERT_NE(a, nullptr);
+    ASSERT_NE(b, nullptr);
+    EXPECT_EQ(a->interval.max(), 100u);
+    EXPECT_EQ(b->interval.max(), 200u);
+}
+
+TEST(Pairing, TheFullRangeOfAValueSurvives) {
+    // Nothing between the hot path and the accumulator may narrow it: zero and
+    // the largest uint64_t are both values somebody can record.
+    Pairer p = make_pairer();
+    p.on_event(ev(kPoint, kValueStep, 0));
+    p.on_event(ev(kPoint, kValueStep, UINT64_MAX));
+
+    Stage* v = find_stage(p, kPoint, kValueStep, kValueStep);
+    ASSERT_NE(v, nullptr);
+    EXPECT_EQ(v->interval.min(), 0u);
+    EXPECT_EQ(v->interval.max(), UINT64_MAX);
+}
+
+TEST(Pairing, AValueLostToAFullStageTableIsCounted) {
+    // The one thing that can go wrong with a value: nowhere to put it. That is
+    // the same out_of_range a transition gets, on the point that lost it.
+    config cfg     = quiet_config();
+    cfg.max_stages = 1;
+
+    Pairer p;
+    p.reset(cfg);
+    p.on_event(ev(1, kValueStep, 10));  // takes the only stage
+    p.on_event(ev(2, kValueStep, 20));  // has nowhere to go
+
+    EXPECT_EQ(stage_count(p), 1u);
+    EXPECT_EQ(p.anomalies_of(1).out_of_range, 0u);
+    EXPECT_EQ(p.anomalies_of(2).out_of_range, 1u);
+}
+
+TEST(Pairing, TheValueStageKeyCollidesWithNoTransition) {
+    // A value's accumulator is keyed (kValueStep, kValueStep). No span can
+    // produce that pair, because kValueStep never reaches the span machinery
+    // to become the step a transition starts or ends on.
+    Pairer p = make_pairer();
+    p.on_event(ev(kPoint, kBeginStep, 1000));
+    p.on_event(ev(kPoint, kMaxSpanStep, 1100));
+    p.on_event(ev(kPoint, kEndStep, 1200));
+
+    EXPECT_EQ(find_stage(p, kPoint, kValueStep, kValueStep), nullptr);
+    EXPECT_NE(stage_key(kPoint, kValueStep, kValueStep), total_key(kPoint));
+    EXPECT_FALSE(is_value_stage(kMaxSpanStep, kEndStep));
+    EXPECT_FALSE(is_value_stage(kBeginStep, kBeginStep));
+}

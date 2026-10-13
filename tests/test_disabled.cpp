@@ -45,6 +45,7 @@ TEST(Disabled, EveryEntryPointStillCompiles) {
     end(pt::alpha);
     begin(pt::beta, 42u);
     end(pt::beta, 42u);
+    value(pt::beta, 1234u);
     stamp<true>(0, make_event(kBeginStep));
     attach(nullptr);
     SUCCEED();
@@ -54,6 +55,7 @@ TEST(Disabled, TheMacrosExpandToNothing) {
     SLICK_PERFMON_BEGIN(pt::alpha);
     SLICK_PERFMON_STEP(pt::alpha, kMid);
     SLICK_PERFMON_END(pt::alpha);
+    SLICK_PERFMON_VALUE(pt::beta, 9u);
     {
         SLICK_PERFMON_SCOPE(pt::beta);
     }
@@ -68,6 +70,9 @@ TEST(Disabled, MacroArgumentsAreNeverEvaluated) {
     SLICK_PERFMON_BEGIN(noisy_point());
     SLICK_PERFMON_STEP(noisy_point(), noisy_step());
     SLICK_PERFMON_END(noisy_point());
+    // The value is the argument most likely to be worth something to compute -
+    // a size() under a lock, a walk of a list - so it matters most here.
+    SLICK_PERFMON_VALUE(noisy_point(), noisy_step());
     {
         SLICK_PERFMON_SCOPE(noisy_point());
     }
@@ -100,6 +105,7 @@ TEST(Disabled, TheCollectorApiIsPresentButInert) {
     c.flush();
 
     EXPECT_EQ(c.snapshot_total(0).count, 0u);
+    EXPECT_EQ(c.snapshot_value(0).count, 0u);
     EXPECT_TRUE(c.reports().empty());
     EXPECT_DOUBLE_EQ(c.tsc_hz(), 0.0);
     EXPECT_EQ(c.overhead_cycles(), 0u);

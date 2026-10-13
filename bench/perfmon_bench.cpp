@@ -203,6 +203,35 @@ void backend_pair(int spans) {
                 best / (spans * 2));
 }
 
+/// The same job for value samples, which skip the span table altogether: one
+/// stage lookup and the accumulator update. Per drained event this has to come
+/// in under pairing, or a value-heavy session would be the one that drops.
+void backend_values(int values) {
+    config cfg         = {};
+    cfg.max_open_spans = 1024;
+    cfg.max_stages     = 64;
+
+    double best = 1e30;
+    for (int r = 0; r < 5; ++r) {
+        Pairer pairer;
+        pairer.reset(cfg);
+        for (int i = 0; i < 1000; ++i) {
+            pairer.on_event(sample{static_cast<uint64_t>(i), kPoint, make_event(kValueStep)});
+        }
+
+        const uint64_t t0 = detail::rdtsc_begin();
+        for (int i = 0; i < values; ++i) {
+            // Spread over a few hundred buckets, as a real distribution is.
+            pairer.on_event(sample{static_cast<uint64_t>(i & 0xFFF), kPoint,
+                                   make_event(kValueStep)});
+        }
+        const uint64_t t1 = detail::rdtsc_step();
+        best = std::min(best, static_cast<double>(t1 - t0));
+    }
+    std::printf("%-38s %8d %14.0f cyc %12.1f\n", "accumulate drained values", values, best,
+                best / values);
+}
+
 /// Opening spans against a table already at its cap. Once full it stays full -
 /// every begin evicts one and inserts one - so this is not a one-off cost, it
 /// is what every begin pays for as long as the overload lasts. Finding the
@@ -396,6 +425,14 @@ int main(int argc, char** argv) {
         (void)b;
     });
 
+    // 8. A value sample: the publish with no timestamp read in front of it.
+    //    Whatever this comes in under case 1 by is what the serialized TSC
+    //    read costs - and it must never come in over.
+    measure("8. value sample (no timestamp)", 1, [] {
+        static volatile uint64_t depth = 42;
+        value(kPoint, depth);
+    });
+
     c.flush();
     print_results(c.tsc_hz());
 
@@ -429,6 +466,7 @@ int main(int argc, char** argv) {
     std::printf("%s\n", std::string(80, '-').c_str());
     for (int spans : {200000}) {
         backend_pair(spans);
+        backend_values(spans * 2);
     }
     for (int spans : {1024, 4096, 16384}) {
         backend_sweep(spans);

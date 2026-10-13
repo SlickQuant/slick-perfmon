@@ -96,6 +96,7 @@ using scoped_sample = ScopedSample;
 #define SLICK_PERFMON_BEGIN(...) ::slick::perfmon::begin(__VA_ARGS__)
 #define SLICK_PERFMON_STEP(...)  ::slick::perfmon::step(__VA_ARGS__)
 #define SLICK_PERFMON_END(...)   ::slick::perfmon::end(__VA_ARGS__)
+#define SLICK_PERFMON_VALUE(...) ::slick::perfmon::value(__VA_ARGS__)
 
 #define SLICK_PERFMON_SCOPE(...)                                  \
     ::slick::perfmon::ScopedSample SLICK_PERFMON_CAT(             \
@@ -106,6 +107,7 @@ using scoped_sample = ScopedSample;
 #define SLICK_PERFMON_BEGIN(...) ((void)0)
 #define SLICK_PERFMON_STEP(...)  ((void)0)
 #define SLICK_PERFMON_END(...)   ((void)0)
+#define SLICK_PERFMON_VALUE(...) ((void)0)
 #define SLICK_PERFMON_SCOPE(...) ((void)0)
 
 #endif

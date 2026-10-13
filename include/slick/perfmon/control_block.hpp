@@ -62,7 +62,11 @@ struct control_block {
     /// 3: the claim marker became a tag over the key rather than an opaque
     /// sentinel, so the word in a slot means something different mid-claim.
     /// Two peers built either side of that must not share a segment.
-    static constexpr uint32_t kLayoutVersion = 3;
+    /// 4: step 0xFE in a ring event became kValueStep, a value sample, where
+    /// it used to be an ordinary intermediate step. The bytes are unchanged,
+    /// but a collector and a producer either side of that would read one
+    /// event two ways - a value as an orphan step, or a step as a value.
+    static constexpr uint32_t kLayoutVersion = 4;
 
     static constexpr uint32_t kUninitialised = 0;
     static constexpr uint32_t kInitialising  = 1;

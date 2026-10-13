@@ -75,6 +75,15 @@ struct StageReport {
     /// two different things answering to one (point, from, to) key.
     bool overflow = false;
 
+    /// The row holds a point's value samples - perfmon::value() - rather than
+    /// a transition. `from` and `to` are both kValueStep, `stage_name` is
+    /// "value" - a label no latency stage is allowed to carry, see
+    /// detail::kValueStageName - and every figure in `interval` and
+    /// `cumulative` is in the unit the values were recorded in:
+    /// config::output_unit does not apply and nothing was converted. The
+    /// counters mean what they mean on any row.
+    bool value = false;
+
     /// The whole run's p50 and p99, in config::output_unit - the two the
     /// summary prints. Always those two, whatever config::percentiles holds:
     /// taken from `cumulative.percentiles` where it has them and computed from
@@ -163,11 +172,24 @@ inline const char* unit_suffix(unit u) noexcept {
  *    because a corrected figure and a raw one differ by a systematic offset
  *    that no reader could detect. The column carries the offset as well, so a
  *    reader can put it back.
+ *
+ *  - whether a row is a latency or a value sample, as the `kind` column. The
+ *    two share the file and so share every figure column, but on a value row
+ *    those hold the values as recorded - in no unit the column names know -
+ *    and the `overhead` column, where there is one, is zero because nothing
+ *    was taken out. That is a difference in what a number means, per row, so
+ *    it is said per row.
+ *
+ * `kind` does a second job by being there at all. A file written before value
+ * samples existed has no such column, and in it any row could be a latency
+ * whatever its stage is called - one named `value` included. Appending value
+ * rows under that header would mix the two with nothing to tell them apart, so
+ * the header differs and start() refuses the file instead.
  */
 inline std::string csv_header(const std::vector<double>& percentiles, unit u,
                               bool subtract_overhead) {
     const std::string sfx = std::string("_") + unit_suffix(u);
-    std::string       h   = "timestamp,point,stage,count,dropped,invalid,stalled,"
+    std::string       h   = "timestamp,point,stage,kind,count,dropped,invalid,stalled,"
                             "abandoned,orphan,out_of_range";
     h += ",min" + sfx;
     h += ",mean" + sfx;
@@ -183,6 +205,18 @@ inline std::string csv_header(const std::vector<double>& percentiles, unit u,
         h += ",overhead" + sfx;
     }
     return h;
+}
+
+/// The `kind` column of a row: what its figure columns hold.
+constexpr std::string_view csv_kind(bool is_value) noexcept {
+    return is_value ? "value" : "latency";
+}
+
+/// Whether a CSV header was written before the `kind` column existed - that
+/// is, before value samples did. Such a file cannot be appended to at all,
+/// whatever the rest of its header says; see csv_header().
+inline bool is_pre_kind_header(std::string_view header) noexcept {
+    return header.find(",stage,kind,") == std::string_view::npos;
 }
 
 /**
@@ -229,6 +263,14 @@ inline std::string format_wall_clock(std::chrono::system_clock::time_point tp) {
                   tm.tm_hour, tm.tm_min, tm.tm_sec, static_cast<int>(ms));
     return buf;
 }
+
+/// The stage label of a value row - what tells it from a latency row in the
+/// CSV and the summary, where the two share columns but not units.
+///
+/// Reserved for that reason: a marker any latency stage could also carry marks
+/// nothing. Stage labels come from the user's name_of, which can return any
+/// text at all including this, so resolve_stage_name() refuses it there.
+inline constexpr std::string_view kValueStageName = "value";
 
 /// Whether a row's counters say something even with no samples behind them.
 /// `dropped` and `stalled` are deliberately not here: they are collector-wide
@@ -482,6 +524,10 @@ public:
     /// Cumulative begin -> end statistics for a point.
     stats snapshot_total(point_id p) { return snapshot(p, kBeginStep, kBeginStep); }
 
+    /// Cumulative statistics over the value samples a point was given, in the
+    /// unit they were recorded in.
+    stats snapshot_value(point_id p) { return snapshot(p, kValueStep, kValueStep); }
+
     /// Every stage, as of the last flush.
     std::vector<StageReport> reports() {
         flush();
@@ -648,6 +694,17 @@ private:
         const std::string have = existing_csv_header();
         if (have.empty() || have == this_csv_header()) {
             return;  // nothing there yet, or the same schema this run writes
+        }
+        if (detail::is_pre_kind_header(have)) {
+            // Its own message, because the advice below does not apply: there
+            // is no setting to restore that makes this file safe to extend.
+            throw std::invalid_argument(
+                "slick-perfmon: config::path '" + cfg_.path +
+                "' holds a CSV written before rows carried a `kind` column. Its rows "
+                "cannot be told from value samples - a latency stage named 'value' "
+                "would read as one - so nothing is appended to it. Use a different "
+                "path, or move the file aside. On disk: '" + have +
+                "'; this session: '" + this_csv_header() + "'.");
         }
         throw std::invalid_argument(
             "slick-perfmon: config::path '" + cfg_.path +
@@ -1116,6 +1173,10 @@ private:
             r.to             = g.to;
             r.anomalies_only = false;
             r.overflow       = false;
+            // A value stage is a row like any other - same counters, same
+            // place in the file - except that its figures are the caller's
+            // numbers and go out as recorded instead of as converted cycles.
+            r.value          = is_value_stage(g.from, g.to);
             resolve_point_name(g.point, r.point_name);
             resolve_stage_name(g.point, g.from, g.to, r.stage_name);
 
@@ -1126,9 +1187,9 @@ private:
             // takes a slot from one that did.
             const PointAnomalies an = pairer_.anomalies_of(g.point);
             to_stats(r.interval, g.interval, an - baseline_of(g.point), new_losses,
-                     new_stalled);
+                     new_stalled, r.value);
             g.interval.merge_into(g.cumulative);
-            to_stats(r.cumulative, g.cumulative, an, last_loss_, stalled_slots_);
+            to_stats(r.cumulative, g.cumulative, an, last_loss_, stalled_slots_, r.value);
             to_summary(r, g.cumulative);
 
             note_row(g.point, n - 1, r);
@@ -1151,6 +1212,7 @@ private:
             // actually moved gets written to the time series.
             r.anomalies_only = any_anomaly(delta);
             r.overflow       = false;
+            r.value          = false;  // the row is recycled; see next_row()
             to_stats(r.interval, empty, delta, new_losses, new_stalled);
             to_stats(r.cumulative, empty, total, last_loss_, stalled_slots_);
             to_summary(r, empty);
@@ -1259,8 +1321,11 @@ private:
     /// alive since an earlier flush, and its percentiles vector is already the
     /// right size. Returning by value would have discarded that buffer and
     /// allocated a replacement twice per row per interval.
+    ///
+    /// @param raw the accumulator holds value samples, not cycles: report its
+    ///        figures as they are instead of converting to config::output_unit.
     void to_stats(stats& s, const Accumulator& acc, const PointAnomalies& an,
-                  uint64_t dropped, uint64_t stalled) const {
+                  uint64_t dropped, uint64_t stalled, bool raw = false) const {
         s.count        = acc.count();
         s.dropped      = dropped;
         s.invalid      = an.invalid;
@@ -1270,15 +1335,15 @@ private:
         s.orphan       = an.orphan;
         s.invariant_tsc = clock_.invariant();
 
-        s.min    = convert(static_cast<double>(acc.min()));
-        s.max    = convert(static_cast<double>(acc.max()));
-        s.mean   = convert(acc.mean());
-        s.stddev = convert(acc.stddev());
+        s.min    = scaled(static_cast<double>(acc.min()), raw);
+        s.max    = scaled(static_cast<double>(acc.max()), raw);
+        s.mean   = scaled(acc.mean(), raw);
+        s.stddev = scaled(acc.stddev(), raw);
 
         s.percentiles.clear();  // keeps the capacity a previous flush paid for
         s.percentiles.reserve(cfg_.percentiles.size());
         for (double p : cfg_.percentiles) {
-            s.percentiles.push_back(convert(acc.percentile(p)));
+            s.percentiles.push_back(scaled(acc.percentile(p), raw));
         }
     }
 
@@ -1304,9 +1369,9 @@ private:
     void to_summary(StageReport& r, const Accumulator& acc) const {
         const std::vector<double>& have = r.cumulative.percentiles;
         r.summary_p50 = summary_p50_at_ < have.size() ? have[summary_p50_at_]
-                                                       : convert(acc.percentile(50.0));
+                                                       : scaled(acc.percentile(50.0), r.value);
         r.summary_p99 = summary_p99_at_ < have.size() ? have[summary_p99_at_]
-                                                       : convert(acc.percentile(99.0));
+                                                       : scaled(acc.percentile(99.0), r.value);
     }
 
     double convert(double cycles) const noexcept {
@@ -1317,6 +1382,10 @@ private:
         default:                 return clock_.to_ns(cycles);
         }
     }
+
+    /// A figure as it is reported: converted from cycles for a stage, left
+    /// alone for a value, which was never in cycles to begin with.
+    double scaled(double v, bool raw) const noexcept { return raw ? v : convert(v); }
 
     /**
      * @brief Drop the cached labels if the shared name table has grown.
@@ -1373,13 +1442,24 @@ private:
             out.assign("total");
             return;
         }
+        if (is_value_stage(from, to)) {
+            // What tells a value row from a latency row in the outputs, so it
+            // is fixed rather than something name_of could rename.
+            out.assign(detail::kValueStageName);
+            return;
+        }
         const uint64_t key = stage_key(p, from, to);
         if (const std::string* hit = stage_names_.find(key)) {
             out.assign(*hit);
             return;
         }
         const std::string_view nm = control_.lookup(p, to);
-        if (nm.empty()) {
+        // A latency stage published under the value label is treated as
+        // unnamed. Honoured, it would put durations in rows a reader filtering
+        // on `stage` takes for raw values - two units under one label, and
+        // nothing in the row to say which. The generated name is ugly, which
+        // is the right amount of pressure to pick another one.
+        if (nm.empty() || nm == detail::kValueStageName) {
             out.assign("step_").append(std::to_string(from))
                .append("->").append(std::to_string(to));
         } else {
@@ -1398,13 +1478,13 @@ private:
     /// one place and not the other is a file whose rows do not all mean the
     /// same thing - the one defect a machine-readable format cannot survive.
     void write_csv_row(const std::string& when, std::string_view point_name,
-                       std::string_view stage_name, const stats& s,
+                       std::string_view stage_name, bool is_value, const stats& s,
                        double hz, double ov) {
         csv_ << when << ',';
         detail::write_csv_field(csv_, point_name);
         csv_ << ',';
         detail::write_csv_field(csv_, stage_name);
-        csv_ << ',' << s.count << ',' << s.dropped << ',' << s.invalid << ','
+        csv_ << ',' << detail::csv_kind(is_value) << ',' << s.count << ',' << s.dropped << ',' << s.invalid << ','
              << s.stalled << ',' << s.abandoned << ',' << s.orphan << ','
              << s.out_of_range << ',' << s.min << ',' << s.mean << ',' << s.stddev;
         for (double p : s.percentiles) {
@@ -1453,7 +1533,10 @@ private:
             if (r.interval.count == 0 && !r.anomalies_only) {
                 continue;
             }
-            write_csv_row(when, r.point_name, r.stage_name, r.interval, hz, ov);
+            // Nothing was subtracted from a value, so the column that says how
+            // much was taken out of a row's figures says none.
+            write_csv_row(when, r.point_name, r.stage_name, r.value, r.interval, hz,
+                          r.value ? 0.0 : ov);
             wrote = true;
         }
 
@@ -1479,7 +1562,7 @@ private:
         if (!wrote && (new_losses != 0 || new_stalled != 0)) {
             to_stats(collector_row_, empty_accumulator(), PointAnomalies{},
                      new_losses, new_stalled);
-            write_csv_row(when, "collector", "total", collector_row_, hz, ov);
+            write_csv_row(when, "collector", "total", false, collector_row_, hz, ov);
         }
 
         // Pushing the stream is a write the collector thread blocks on, and it
@@ -1614,13 +1697,28 @@ private:
                << std::setw(10) << r.cumulative.invalid
                << std::setw(11) << r.cumulative.abandoned
                << std::setw(10) << r.cumulative.orphan
-               << std::setw(14) << r.cumulative.out_of_range
-               << std::setw(12) << unit_string(r.cumulative.min)
-               << std::setw(12) << unit_string(r.cumulative.mean)
-               << std::setw(12) << unit_string(r.summary_p50)
-               << std::setw(12) << unit_string(r.summary_p99)
-               << std::setw(12) << unit_string(r.cumulative.max) << '\n';
+               << std::setw(14) << r.cumulative.out_of_range;
+            // A space and eleven columns rather than twelve columns: the same
+            // thing for every duration, which is never that wide, but a value
+            // can be all twenty digits of a uint64_t, and setw() pads without
+            // ever separating.
+            for (const std::string& figure :
+                 {figure_string(r, r.cumulative.min, 0), figure_string(r, r.cumulative.mean, 2),
+                  figure_string(r, r.summary_p50, 0), figure_string(r, r.summary_p99, 0),
+                  figure_string(r, r.cumulative.max, 0)}) {
+                os << ' ' << std::setw(11) << figure;
+            }
+            os << '\n';
         }
+    }
+
+    /// One figure of a summary row: a duration for a stage, and for a value
+    /// row the bare number, since no unit this library knows applies to it.
+    ///
+    /// @param value_decimals decimals for a value. Whole numbers went in, so
+    ///        the order statistics are whole and only the mean has a fraction.
+    std::string figure_string(const StageReport& r, double v, int value_decimals) const {
+        return r.value ? detail::format_fixed(v, value_decimals, "") : unit_string(v);
     }
 
     std::string unit_string(double v) const {
@@ -1781,6 +1879,7 @@ struct StageReport {
     stats       cumulative;
     bool        anomalies_only = false;
     bool        overflow       = false;
+    bool        value          = false;
     double      summary_p50    = 0.0;
     double      summary_p99    = 0.0;
 };
@@ -1804,6 +1903,7 @@ public:
 
     stats snapshot(point_id, uint8_t, uint8_t) { return {}; }
     stats snapshot_total(point_id) { return {}; }
+    stats snapshot_value(point_id) { return {}; }
     std::vector<StageReport> reports() { return {}; }
     void   dump_summary(std::ostream&) {}
     double tsc_hz() const noexcept { return 0.0; }

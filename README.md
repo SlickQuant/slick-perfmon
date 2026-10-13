@@ -47,6 +47,9 @@ from the same events.
   another thread, or in another DLL — the stamps carry everything needed to pair them.
 - **Concurrent spans on one point**, told apart by a 24-bit correlation id you supply
   (an order id, a message sequence, a thread index).
+- **Values as well as latencies.** `value(point, n)` records a number that is a
+  measurement in itself — a queue depth, a batch size, a byte count — with no begin, no
+  end and no timestamp, for ~30 cycles. It gets the same statistics, in the same CSV.
 - **Out-of-process collection.** The measured process does zero analysis and no file
   I/O, and its numbers survive its own crash.
 - **Compiles to nothing.** `SLICK_PERFMON_ENABLED=0` removes every stamp, the ring and
@@ -100,7 +103,7 @@ target_link_libraries(main PRIVATE slick::perfmon)
 
 | Header | Contents | Who includes it |
 |---|---|---|
-| `<slick/perfmon.hpp>` | `begin` / `step` / `end`, `SLICK_PERFMON_SCOPE` | every instrumented file |
+| `<slick/perfmon.hpp>` | `begin` / `step` / `end`, `value`, `SLICK_PERFMON_SCOPE` | every instrumented file |
 | `<slick/perfmon/types.hpp>` | `config`, `stats`, `name_fn` | whoever builds a config |
 | `<slick/perfmon/collector.hpp>` | `Collector`, `StageReport` | `main()`, the collector, tests |
 
@@ -129,7 +132,9 @@ enum class perf : slick::perfmon::point_id {
     count
 };
 
-enum : uint8_t { kDecode = 1, kMatch = 2, kSend = 3 };   // 0x00 = begin, 0xFF = end
+enum : uint8_t { kDecode = 1, kMatch = 2, kSend = 3 };   // 0x01..0xFD are yours:
+                                                         // 0x00 = begin, 0xFF = end,
+                                                         // 0xFE = a value sample
 
 constexpr std::string_view perf_name(slick::perfmon::point_id p, uint8_t step) noexcept {
     using namespace slick::perfmon;
@@ -151,7 +156,9 @@ constexpr std::string_view perf_name(slick::perfmon::point_id p, uint8_t step) n
 ```
 
 Returning an empty view means "unnamed", and the output falls back to `point_<p>` /
-`step_<a>-><b>`. `name_of` may also be `nullptr` for a quick one-off measurement.
+`step_<a>-><b>`. `name_of` may also be `nullptr` for a quick one-off measurement. One
+stage name is taken: `value` marks a [value sample](#record-a-value)'s row, so a step
+named that is reported as unnamed.
 
 ### Start a session
 
@@ -260,6 +267,33 @@ open span per point, and costs nothing extra.
 
 If you get it wrong, you get `abandoned` counts rather than a plausible wrong number.
 
+### Record a value
+
+Not everything worth watching is a duration. A value sample has no begin and no end —
+each call is one complete measurement:
+
+```cpp
+void on_batch(const batch& b) {
+    slick::perfmon::value(perf::batch_size, b.size());    // or SLICK_PERFMON_VALUE(...)
+    slick::perfmon::value(perf::queue_depth, queue_.size());
+    ...
+}
+```
+
+The backend reports the distribution of the values a point was given — count, min,
+mean, stddev, percentiles, max — exactly as it does for a latency, but **as recorded**:
+no cycles-to-time conversion, no `output_unit`, no overhead subtraction. The unit is
+whatever you passed in. A value is an unsigned 64-bit integer; a negative number
+converts the way the language says and comes out as a very large one.
+
+It is also the cheapest thing in the library. The expensive part of a stamp is the
+serialized TSC read, and a value has no use for a timestamp, so `value()` is the null
+check and the 16-byte publish and nothing else — ~30 cycles against ~200.
+
+Value points come out of the same id space as span points and are named the same way
+(`name_of(point, kBeginStep)`). Give a point values or spans, not both: the two would
+share a name in the output while meaning unrelated things.
+
 ### Reading the results
 
 ```cpp
@@ -269,9 +303,13 @@ auto& perfmon = collector::instance();
 perfmon.flush();                                     // drain and publish a snapshot
 auto total = perfmon.snapshot_total(to_point(perf::tick_to_trade));
 auto decode = perfmon.snapshot(to_point(perf::tick_to_trade), kBeginStep, kDecode);
+auto batch = perfmon.snapshot_value(to_point(perf::batch_size));   // raw, not ns
 
 perfmon.dump_summary(std::cout);
 ```
+
+In `reports()`, a value point's row has `StageReport::value` set and the stage name
+`value`.
 
 ### Out-of-process collection
 
@@ -338,6 +376,7 @@ using span_seq = uint32_t;      // 24 usable bits; kNoSeq (0) = unkeyed
 template <point_like T> void begin(T point, span_seq seq = kNoSeq) noexcept;
 template <point_like T> void step (T point, uint8_t n, span_seq seq = kNoSeq) noexcept;
 template <point_like T> void end  (T point, span_seq seq = kNoSeq) noexcept;
+template <point_like T> void value(T point, uint64_t v) noexcept;   // no span, no timestamp
 
 class ScopedSample { ... };     // begin on construction, end on destruction
 
@@ -354,6 +393,7 @@ class Collector {
 
     stats snapshot(point_id, uint8_t from, uint8_t to);
     stats snapshot_total(point_id);
+    stats snapshot_value(point_id);                  // a value point, as recorded
     std::vector<StageReport> reports();
     void dump_summary(std::ostream&);
 
@@ -372,6 +412,12 @@ class Collector {
 
 - **A `seq` must be unique among the spans open on one point.** Reusing one while its
   span is still open counts as `abandoned`.
+- **Step `0xFE` is reserved.** It marks a value sample (`kValueStep`), so the steps a
+  span may use as intermediate boundaries are `0x01..0xFD` (`kMaxSpanStep`). A
+  `step(point, 0xFE)` would be read back as a value sample holding a timestamp. Because
+  that changes what an event in the ring means, the shared-memory layout version went up
+  with it: a collector and a producer built either side of this change refuse to share a
+  segment rather than misread each other, so rebuild them together.
 - **The ring overwrites; it never blocks.** A producer that outruns the collector loses
   samples, and a lost stamp corrupts *pairing* rather than just perturbing one number.
   Check `dropped` first whenever `orphan` or `abandoned` climb, and raise
@@ -473,6 +519,13 @@ each field lowers to the store instruction a plain assignment emitted. The only 
 given up is store merging across the two adjacent 32-bit fields, and the benchmark puts
 that inside the run-to-run noise.
 
+A value sample is the same record with the step set to `kValueStep` and the value in the
+64 bits a timestamp would occupy. One record for both kinds, rather than a second ring,
+keeps the hot path at a single pointer load and a shared-memory session at one ring
+segment. The collector recognises the step before any pairing happens and sends the
+value straight to its point's accumulator: it opens no span, so nothing about it can be
+orphaned, abandoned or invalid.
+
 The collector's side of the same contract: the drain snapshots each slot into a local
 before pairing it, rather than handing the pairer a reference into live ring
 memory. The pairer reads `event`, `point` and `timestamp` several times each, and a
@@ -498,10 +551,10 @@ ring is sized to absorb that much production and the collector costs almost no C
 ### CSV — one row per stage per interval
 
 ```
-timestamp,point,stage,count,dropped,invalid,stalled,abandoned,orphan,out_of_range,min_ns,mean_ns,stddev_ns,p50_ns,p90_ns,p99_ns,p99_9_ns,max_ns,tsc_hz
-2026-09-20 18:51:00.000,tick_to_trade,decode,120345,0,0,0,0,0,0,41.2,58.3,11.2,55.0,71.0,140.0,890.0,1204.0,2995200000
-2026-09-20 18:51:00.000,tick_to_trade,match,120345,0,0,0,0,0,0,88.0,131.5,22.4,126.0,168.0,310.0,1400.0,2980.0,2995200000
-2026-09-20 18:51:00.000,tick_to_trade,total,120345,0,0,0,0,0,0,201.0,284.9,41.7,275.0,340.0,690.0,3100.0,6200.0,2995200000
+timestamp,point,stage,kind,count,dropped,invalid,stalled,abandoned,orphan,out_of_range,min_ns,mean_ns,stddev_ns,p50_ns,p90_ns,p99_ns,p99_9_ns,max_ns,tsc_hz
+2026-09-20 18:51:00.000,tick_to_trade,decode,latency,120345,0,0,0,0,0,0,41.2,58.3,11.2,55.0,71.0,140.0,890.0,1204.0,2995200000
+2026-09-20 18:51:00.000,tick_to_trade,match,latency,120345,0,0,0,0,0,0,88.0,131.5,22.4,126.0,168.0,310.0,1400.0,2980.0,2995200000
+2026-09-20 18:51:00.000,tick_to_trade,total,latency,120345,0,0,0,0,0,0,201.0,284.9,41.7,275.0,340.0,690.0,3100.0,6200.0,2995200000
 ```
 
 `point` and `stage` are separate columns so a `groupby` is trivial. `tsc_hz` is a column
@@ -514,6 +567,34 @@ of every figure in the row, so a reader can put it back. Numbers are always writ
 the classic `"C"` locale — a `.` decimal point and no digit grouping — whatever global
 locale the process sets, so a German or French desktop cannot put a stray comma in a row.
 The summary file follows the same rule; `dump_summary()` leaves a caller's stream as it is.
+
+Value samples are rows of the same file, one per value point per interval. The `kind`
+column says which a row is — `latency` or `value`:
+
+```
+2026-09-20 18:51:00.000,batch_size,value,value,120345,0,0,0,0,0,0,1.0,37.4,22.9,32.0,70.0,118.0,180.0,200.0,2995200000
+```
+
+The columns are the same for both kinds; what differs is how to read them. **On a
+`kind=value` row the figures under `min_ns` … `max_ns` are the values as recorded, in
+whatever unit you passed in, not nanoseconds.** Filter on `kind` before aggregating a
+latency column. `count` and the anomaly counters mean what they mean on any row, `tsc_hz`
+is carried as usual, and `overhead_<unit>`, where the file has it, is `0.0` because
+nothing was subtracted. Rows that carry only counters — an anomaly-only `total`, the
+`collector` and `overflow` rows below — are `latency`: the counters describe spans.
+
+The stage label `value` is reserved as well, so the `stage` column and the summary table
+agree with `kind`. A `name_of` that returns `"value"` for a step of a span is treated as
+returning no name, and the stage gets the generated `step_<a>-><b>` label instead. A
+*point* may still be called `value`. For code rather than a file, `StageReport::value`
+says which kind a row is.
+
+**A CSV written before the `kind` column existed is not appended to.** In such a file
+any row could be a latency whatever its stage was called — `value` included, since the
+label was not reserved then — so value rows added beneath it could never be told apart
+from what was already there. Its header no longer matches, and `start()` throws
+`std::invalid_argument` saying so. Point `config::path` somewhere new or move the old
+file aside; nothing in it is modified.
 
 Restarting a collector appends rather than starting over — but only onto a matching
 schema. The percentile list decides which columns exist; the unit and the overhead
@@ -569,12 +650,16 @@ point               stage                  count   dropped   invalid  abandoned 
 tick_to_trade       decode               1204531         0         0          0         0             0      41.2ns      58.3ns      55.0ns     140.0ns      1.20us
 tick_to_trade       match                1204531         0         0          0         0             0      88.0ns     131.5ns     126.0ns     310.0ns      2.98us
 tick_to_trade       total                1204531         0         0          0         0             0     201.0ns     284.9ns     275.0ns     690.0ns      6.20us
+batch_size          value                1204531         0         0          0         0             0           1       37.42          32         118         200
 ```
 
 The `p50` and `p99` columns are always the whole run's median and 99th percentile,
 whatever `percentiles` is set to: taken from the configured list when it has them and
 computed from the histogram when it does not. `StageReport::summary_p50` and
 `summary_p99` carry the same two values.
+
+A value point is a row of the same table, with stage `value` and its figures printed as
+bare numbers: no unit is attached because none this library knows applies.
 
 ## Measured overhead
 
@@ -591,13 +676,16 @@ unpinned. Minimum of 15 repetitions of 20,000 iterations; run-to-run spread is a
 | `SLICK_PERFMON_SCOPE` guard | 191 | ~58 |
 | Single stamp, `SLICK_PERFMON_SERIALIZE=0` | 172 | ~52 |
 | `begin`/`end` pair, `SLICK_PERFMON_SERIALIZE=0` | 130 | ~39 |
+| Value sample (`value()`, no timestamp) | **29** | ~9 |
 | Runtime-disabled | **2.5** | ~0.8 |
 | Compile-time disabled (`SLICK_PERFMON_ENABLED=0`) | **0.0** | **0.0** |
 
-Three things worth reading off that table:
+Four things worth reading off that table:
 
 - **Per-stamp cost is flat.** A six-stamp pipeline costs the same per stamp as a single
   one, which is what makes multi-step spans worth using.
+- **Most of a stamp is the timestamp.** A value sample is the same publish without the
+  serialized TSC read in front of it, and costs about a seventh as much.
 - **A runtime `seq` is free.** No worse than the unkeyed pair, confirming the
   RDTSC-versus-RDTSCP choice stays a compile-time decision even when the caller passes a
   runtime correlation id.
@@ -708,7 +796,8 @@ trust, since no sample can come in under the true cost but any sample can be inf
 an interrupt.
 
 The last block measures the collector rather than the hot path: pairing one drained
-event, expiring abandoned spans, and rebuilding the report rows. None of it is part of
+event, accumulating one drained value (~65 cycles against ~90 for a paired stamp, as it
+skips the span table), expiring abandoned spans, and rebuilding the report rows. None of it is part of
 the overhead budget, but all of it is time the ring is not being drained, so it is what
 decides whether a busy session drops samples.
 

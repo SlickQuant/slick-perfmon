@@ -98,7 +98,9 @@ struct config {
 };
 
 /**
- * @brief A snapshot of one stage, in config::output_unit.
+ * @brief A snapshot of one stage, in config::output_unit - or of one value
+ *        point, in whatever unit the caller's values were in: those are
+ *        reported as recorded, with no conversion.
  *
  * The anomaly counters are not an afterthought: in an event model a dropped or
  * unmatched stamp corrupts pairing rather than just perturbing one number, so

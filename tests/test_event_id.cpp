@@ -25,6 +25,17 @@ static_assert(seq_of(make_event(0x42, 0x1234u)) == 0x1234u);
 static_assert(step_of(make_event(kEndStep, 0xFFFFFFFFu)) == kEndStep);
 static_assert(seq_of(make_event(kEndStep, 0xFFFFFFFFu)) == kMaxSeq);
 
+// The value marker is a step of its own: neither end of a span, and above
+// every step a span may use as a boundary. An event is a value because of its
+// step alone, whatever sits in the seq bits beside it.
+static_assert(kValueStep != kBeginStep && kValueStep != kEndStep);
+static_assert(kMaxSpanStep < kValueStep);
+static_assert(is_value_event(make_event(kValueStep)));
+static_assert(is_value_event(make_event(kValueStep, kMaxSeq)));
+static_assert(!is_value_event(make_event(kBeginStep)));
+static_assert(!is_value_event(make_event(kEndStep)));
+static_assert(!is_value_event(make_event(kMaxSpanStep, kMaxSeq)));
+
 static_assert(sizeof(sample) == 16);
 static_assert(alignof(sample) == 16);
 static_assert(std::is_trivially_copyable_v<sample>);
@@ -61,6 +72,26 @@ TEST(EventId, BeginAndEndAreDistinctFromEveryIntermediateStep) {
     }
 }
 
+TEST(EventId, NoSpanBoundaryReadsAsAValue) {
+    // Reserving kValueStep took one step away from spans. Every step a span is
+    // still allowed has to stay a stamp, or a pipeline would lose a boundary
+    // to the value table.
+    for (uint32_t s = kBeginStep; s <= kMaxSpanStep; ++s) {
+        EXPECT_FALSE(is_value_event(make_event(static_cast<uint8_t>(s), 0xABCDEFu))) << s;
+    }
+    EXPECT_FALSE(is_value_event(make_event(kEndStep, 0xABCDEFu)));
+}
+
+TEST(EventId, AValueSampleCarriesItsValueWhereTheTimestampWouldBe) {
+    // The record has no room for both, and a value has no use for a timestamp:
+    // the full 64 bits are the value's.
+    constexpr uint64_t kBig = 0xFEDCBA9876543210ull;
+    const sample       s{kBig, 5, make_event(kValueStep)};
+    EXPECT_TRUE(is_value_event(s.event));
+    EXPECT_EQ(s.value(), kBig);
+    EXPECT_EQ(s.point, 5u);
+}
+
 TEST(EventId, PointAndEventAreAdjacentAndTheRecordStartsAtTheTimestamp) {
     // Not cosmetic. The layout is the cross-process contract for a shared ring,
     // and keeping the three fields packed into 16 aligned bytes is what lets a
@@ -88,6 +119,7 @@ TEST(EventId, AcceptsAScopedEnumWithoutACast) {
     begin(scoped_point::alpha);
     step(scoped_point::alpha, 3);
     end(scoped_point::alpha);
+    value(scoped_point::alpha, 17u);
     ScopedSample guard(scoped_point::beta, 11u);
     EXPECT_EQ(guard.point(), 9u);
     EXPECT_EQ(guard.seq(), 11u);

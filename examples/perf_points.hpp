@@ -20,11 +20,12 @@ enum class perf : slick::perfmon::point_id {
     tick_to_trade = 0,
     book_update   = 1,
     round_trip    = 2,
+    batch_size    = 3,  // a value point: recorded with value(), never begun or ended
     count
 };
 
-/// Intermediate step boundaries within tick_to_trade. 0x00 is begin and 0xFF
-/// is end, so these live in between.
+/// Intermediate step boundaries within tick_to_trade. 0x00 is begin, 0xFF is
+/// end and 0xFE marks a value sample, so these live in 0x01..0xFD.
 enum : uint8_t {
     kDecode = 1,
     kMatch  = 2,
@@ -50,6 +51,8 @@ constexpr std::string_view perf_name(slick::perfmon::point_id p, uint8_t step) n
         return step == kBeginStep ? "book_update" : std::string_view{};
     case perf::round_trip:
         return step == kBeginStep ? "round_trip" : std::string_view{};
+    case perf::batch_size:
+        return step == kBeginStep ? "batch_size" : std::string_view{};
     default:
         return {};
     }

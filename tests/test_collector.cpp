@@ -789,3 +789,180 @@ TEST(CollectorTest, ShutdownIsNotHeldByAProducerThatKeepsPublishing) {
         << std::chrono::duration_cast<std::chrono::milliseconds>(took).count()
         << " ms for a producer that never stopped";
 }
+
+// --------------------------------------------------------------------------
+// Value samples: value() records a number, with no begin and no end.
+// --------------------------------------------------------------------------
+
+namespace {
+
+/// The one row holding a point's value samples, or rows.end().
+auto find_value_row(const std::vector<StageReport>& rows, point_id p) {
+    return std::find_if(rows.begin(), rows.end(),
+                        [p](const StageReport& r) { return r.value && r.point == p; });
+}
+
+}  // namespace
+
+TEST(CollectorTest, ValueSamplesAreReportedAsRecorded) {
+    Collector c;
+    config    cfg   = quiet_config();
+    cfg.point_count = static_cast<point_id>(pt::count);
+    ASSERT_TRUE(c.start(cfg));
+    ASSERT_EQ(cfg.output_unit, unit::nanoseconds)
+        << "the default unit converts, which is what makes the exact figures below a test";
+
+    for (uint64_t v = 1; v <= 100; ++v) {
+        value(pt::other, v);
+    }
+
+    // Exactly the numbers that went in. A latency on this path is divided by
+    // the TSC rate on its way out; these must not be, and at any rate other
+    // than 1 GHz to the cycle they would not survive it.
+    const stats s = c.snapshot_value(to_point(pt::other));
+    EXPECT_EQ(s.count, 100u);
+    EXPECT_DOUBLE_EQ(s.min, 1.0);
+    EXPECT_DOUBLE_EQ(s.max, 100.0);
+    EXPECT_NEAR(s.mean, 50.5, 1e-9);
+    EXPECT_NEAR(s.stddev, 29.011, 0.001);
+    EXPECT_EQ(s.dropped, 0u);
+
+    // Percentiles come from the same histogram a latency uses, so they carry
+    // its error bound and no more.
+    ASSERT_EQ(s.percentiles.size(), cfg.percentiles.size());
+    EXPECT_NEAR(s.percentiles[0], 50.0, 50.0 * 2 * Histogram::kRelativeError);
+    EXPECT_NEAR(s.percentiles[2], 99.0, 99.0 * 2 * Histogram::kRelativeError);
+
+    // There was never a span on the point, so there is no total for it - and
+    // nothing about a value with no span around it is an anomaly.
+    EXPECT_EQ(c.snapshot_total(to_point(pt::other)).count, 0u);
+
+    const auto rows = c.reports();
+    const auto row  = find_value_row(rows, to_point(pt::other));
+    ASSERT_NE(row, rows.end());
+    EXPECT_EQ(row->from, kValueStep);
+    EXPECT_EQ(row->to, kValueStep);
+    EXPECT_EQ(row->stage_name, "value");
+    EXPECT_EQ(row->cumulative.count, 100u);
+    EXPECT_DOUBLE_EQ(row->summary_p50, s.percentiles[0]);
+    EXPECT_EQ(row->cumulative.orphan, 0u);
+    EXPECT_EQ(row->cumulative.abandoned, 0u);
+    EXPECT_EQ(row->cumulative.invalid, 0u);
+    c.shutdown();
+}
+
+TEST(CollectorTest, ValuesAndSpansShareASessionWithoutMixing) {
+    Collector c;
+    config    cfg   = quiet_config();
+    cfg.point_count = static_cast<point_id>(pt::count);
+    // Whatever the correction is on this machine, a value is not an interval
+    // between two stamps and must come through it untouched.
+    cfg.subtract_overhead = true;
+    ASSERT_TRUE(c.start(cfg));
+
+    constexpr int kEach = 2000;
+    for (int i = 0; i < kEach; ++i) {
+        begin(pt::work);
+        value(pt::other, 5);
+        end(pt::work);
+    }
+
+    const stats spans = c.snapshot_total(to_point(pt::work));
+    EXPECT_EQ(spans.count, kEach);
+    EXPECT_EQ(spans.orphan, 0u);
+    EXPECT_EQ(spans.abandoned, 0u);
+    EXPECT_EQ(spans.invalid, 0u);
+
+    const stats values = c.snapshot_value(to_point(pt::other));
+    EXPECT_EQ(values.count, kEach);
+    EXPECT_DOUBLE_EQ(values.min, 5.0);
+    EXPECT_DOUBLE_EQ(values.max, 5.0);
+
+    const auto rows = c.reports();
+    EXPECT_EQ(find_value_row(rows, to_point(pt::work)), rows.end())
+        << "a point that only stamped spans has no value row";
+    c.shutdown();
+}
+
+TEST(CollectorTest, TheRuntimeSwitchCoversValuesToo) {
+    // The switch is the ring pointer, and value() checks the same one.
+    Collector c;
+    config    cfg   = quiet_config();
+    cfg.point_count = static_cast<point_id>(pt::count);
+    ASSERT_TRUE(c.start(cfg));
+
+    value(pt::other, 1);
+    c.set_enabled(false);
+    for (int i = 0; i < 100; ++i) {
+        value(pt::other, 1000);
+    }
+    c.set_enabled(true);
+    value(pt::other, 2);
+
+    const stats s = c.snapshot_value(to_point(pt::other));
+    EXPECT_EQ(s.count, 2u);
+    EXPECT_DOUBLE_EQ(s.max, 2.0) << "a value recorded while disabled got through";
+    c.shutdown();
+}
+
+TEST(CollectorTest, AnAnomalyOnAValuePointRidesOnItsValueRow) {
+    // A value row is a row of its point like any other, with the same counter
+    // columns. So a stray stamp on a point that otherwise only records values
+    // is reported there, as it would be on a stage row - and not on a second,
+    // empty row for a point that already has one.
+    Collector c;
+    config    cfg   = quiet_config();
+    cfg.point_count = static_cast<point_id>(pt::count);
+    ASSERT_TRUE(c.start(cfg));
+
+    for (int i = 0; i < 10; ++i) {
+        value(pt::other, 3);
+    }
+    end(pt::other);  // no begin: an orphan
+
+    const auto rows      = c.reports();
+    const auto value_row = find_value_row(rows, to_point(pt::other));
+    ASSERT_NE(value_row, rows.end());
+    EXPECT_EQ(value_row->cumulative.count, 10u);
+    EXPECT_EQ(value_row->cumulative.orphan, 1u);
+
+    const auto others = std::count_if(rows.begin(), rows.end(), [](const StageReport& r) {
+        return !r.value && r.point == to_point(pt::other);
+    });
+    EXPECT_EQ(others, 0) << "the orphan was reported twice";
+    c.shutdown();
+}
+
+TEST(CollectorTest, ValuesFromSeveralThreadsAreAllAccountedFor) {
+    Collector c;
+    config    cfg      = quiet_config();
+    cfg.point_count    = static_cast<point_id>(pt::count);
+    cfg.queue_capacity = 1u << 18;
+    ASSERT_TRUE(c.start(cfg));
+
+    // Sized to fit in the ring, as the span tests are: zero drops is only an
+    // assertion when nothing could have been overwritten.
+    constexpr int kThreads = 8;
+    constexpr int kValues  = 4000;
+    static_assert(kThreads * kValues < (1 << 18), "the run must fit in the ring");
+
+    std::vector<std::thread> threads;
+    for (int t = 0; t < kThreads; ++t) {
+        threads.emplace_back([t] {
+            for (int i = 0; i < kValues; ++i) {
+                value(pt::other, static_cast<uint64_t>(t + 1));
+            }
+        });
+    }
+    for (auto& th : threads) {
+        th.join();
+    }
+
+    const stats s = c.snapshot_value(to_point(pt::other));
+    EXPECT_EQ(s.count, static_cast<uint64_t>(kThreads) * kValues);
+    EXPECT_EQ(s.dropped, 0u);
+    EXPECT_DOUBLE_EQ(s.min, 1.0);
+    EXPECT_DOUBLE_EQ(s.max, static_cast<double>(kThreads));
+    EXPECT_NEAR(s.mean, (1.0 + kThreads) / 2.0, 1e-9);
+    c.shutdown();
+}

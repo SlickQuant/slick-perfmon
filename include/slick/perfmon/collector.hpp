@@ -443,9 +443,11 @@ public:
         // and removes the common case of that race. A stamp still in flight
         // when ~Collector runs remains the caller's responsibility to avoid.
         //
-        // A shared ring is also remembered by name, because a retired one keeps
-        // its segment - and so its name - alive; open_transport() lets it go
-        // when a later session wants that name back.
+        // A shared ring is also remembered by name, so open_transport() can
+        // drop this stale mapping when a later session opens that name again.
+        //
+        // Nothing is unlinked, here or below: both segments are left for the
+        // next session, or a producer still running, to find. See remove_shm().
         if (ring_) {
             retired_rings_.push_back({std::move(ring_), cfg_.run_mode == mode::local
                                                             ? std::string{}
@@ -479,6 +481,41 @@ public:
     }
 
     bool running() const noexcept { return started_; }
+
+    /**
+     * @brief Remove the shared segments of the session named @p shm_name: the
+     *        ring, and the control block beside it.
+     *
+     * Never done implicitly. Neither shutdown() nor ~Collector unlinks
+     * anything, because a Collector cannot know whether a producer is still
+     * attached: removing a name under one leaves it stamping into a segment
+     * nobody will open again, while the next collector makes a fresh one under
+     * the same name and sees none of it. Left alone, the next collector opens
+     * the same two segments instead and a producer that ran through the
+     * restart is still collected, under the names it published.
+     *
+     * So this is for whoever coordinates the session, once no peer will attach
+     * again - and for the cases a leftover gets in the way of. On POSIX a
+     * segment outlives every process that mapped it, and a name stays bound to
+     * what it was created with: a different queue_capacity or max_names is
+     * refused as a mismatch, and a point keeps the label first published for
+     * it. Removing the name is how it is given a clean start.
+     *
+     * Safe at any time. Mappings already open, a running session's included,
+     * stay valid until they are closed; the name simply stops leading to them.
+     * A name that is not there is not an error. On Windows a segment is freed
+     * with its last handle and there is no name to remove, so this does
+     * nothing there.
+     */
+    static void remove_shm(const std::string& shm_name) noexcept {
+        for (const char* suffix : {"", SLICK_PERFMON_META_SUFFIX}) {
+            try {
+                slick::shm::shared_memory::remove((shm_name + suffix).c_str());
+            } catch (...) {
+                // Out of memory building a name. Nothing to add to that here.
+            }
+        }
+    }
 
     /// Live on/off switch. Costs the producer nothing beyond the null check it
     /// already performs, because the switch *is* that pointer.
@@ -766,15 +803,19 @@ private:
     }
 
     /**
-     * @brief Free a retired ring that still holds the segment @p name.
+     * @brief Drop this Collector's own mapping of a retired ring on @p name.
      *
-     * A retired shared ring keeps its segment mapped, and a mapped segment
-     * keeps its name: on Windows for as long as any handle is open, on POSIX
-     * until the owner unlinks it on destruction. Opening that name again would
-     * attach this session to the previous session's segment instead of
-     * creating its own - silently with the old capacity, or with a size
-     * mismatch thrown when the capacity changed, and an attach-only producer
-     * would find a "collector" that is only its own leftover.
+     * A retired ring stays mapped until the Collector is destroyed, and on
+     * Windows a mapped segment keeps its name for as long as any handle to it
+     * is open. Left in place, a later session on the same name would find a
+     * segment that only this object's leftover is holding up: it could not
+     * come back with a different queue_capacity, and an attach-only producer
+     * would find a "collector" that is nothing but its own past.
+     *
+     * Only the mapping goes. The name is deliberately not unlinked - see
+     * remove_shm() for why that is never done implicitly - so on POSIX, and on
+     * Windows while a producer is still attached, the session about to start
+     * opens this same segment again and carries on draining it.
      *
      * Freeing it reopens the race retirement exists for, but only for a stamp
      * that loaded the pointer before shutdown() detached it and is still
@@ -1897,6 +1938,7 @@ public:
     bool start(config = {}) { return false; }
     void shutdown() {}
     bool running() const noexcept { return false; }
+    static void remove_shm(const std::string&) noexcept {}
     void set_enabled(bool) noexcept {}
     bool enabled() const noexcept { return false; }
     void flush() {}

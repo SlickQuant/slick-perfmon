@@ -8,12 +8,14 @@
 #include <slick/perfmon.hpp>
 #include <slick/perfmon/collector.hpp>
 
+#include "shm_test_support.hpp"
 #include "test_support.hpp"
 
 #include <gtest/gtest.h>
 
 #include <chrono>
 #include <cstdlib>
+#include <memory>
 #include <string>
 #include <thread>
 #include <vector>
@@ -76,7 +78,7 @@ config collector_config(const std::string& shm) {
 }  // namespace
 
 TEST(Shm, CollectsSpansFromAnotherProcess) {
-    const std::string shm = unique_shm_name("basic");
+    const scoped_shm_name shm("basic");
 
     Collector c;
     ASSERT_TRUE(c.start(collector_config(shm)));
@@ -98,7 +100,7 @@ TEST(Shm, CollectsSpansFromAnotherProcess) {
 }
 
 TEST(Shm, NamesPublishedByTheCollectorLabelAnotherProcessSpans) {
-    const std::string shm = unique_shm_name("names2");
+    const scoped_shm_name shm("names2");
 
     Collector c;
     ASSERT_TRUE(c.start(collector_config(shm)));
@@ -121,7 +123,7 @@ TEST(Shm, NamesPublishedByTheCollectorLabelAnotherProcessSpans) {
 
 TEST(Shm, TwoProducersOnDisjointPointRangesDoNotInterfere) {
     // The documented way to keep processes apart: partition the id space.
-    const std::string shm = unique_shm_name("two");
+    const scoped_shm_name shm("two");
 
     Collector c;
     ASSERT_TRUE(c.start(collector_config(shm)));
@@ -146,7 +148,7 @@ TEST(Shm, TwoProducersSharingOnePointMergeIntoOneRow) {
     // The other documented option: share an id deliberately so the numbers
     // combine. Each process takes its own seq range, so the spans stay
     // distinguishable even though they land on the same point.
-    const std::string shm = unique_shm_name("merge");
+    const scoped_shm_name shm("merge");
 
     Collector c;
     ASSERT_TRUE(c.start(collector_config(shm)));
@@ -170,7 +172,7 @@ TEST(Shm, TwoProducersWithCollidingSeqsAreDetectedNotMispaired) {
     // The failure mode of the test above: both processes using seq 1..N on one
     // point. What matters is that it shows up in the anomaly counters rather
     // than as a believable latency.
-    const std::string shm = unique_shm_name("collide");
+    const scoped_shm_name shm("collide");
 
     Collector c;
     ASSERT_TRUE(c.start(collector_config(shm)));
@@ -195,7 +197,7 @@ TEST(Shm, TwoProducersWithCollidingSeqsAreDetectedNotMispaired) {
 TEST(Shm, SpansLeftOpenByAProducerAreEventuallyAbandoned) {
     // A producer that exits mid-span - or dies - must not leak an open-span
     // slot for the life of the collector.
-    const std::string shm = unique_shm_name("leak");
+    const scoped_shm_name shm("leak");
 
     config cfg                 = collector_config(shm);
     cfg.stalled_sample_timeout = std::chrono::milliseconds(50);
@@ -223,7 +225,7 @@ TEST(Shm, SpansLeftOpenByAProducerAreEventuallyAbandoned) {
 TEST(Shm, AProducerStartedBeforeTheCollectorRecordsNothingAndSaysSo) {
     // The safe default: an instrumented binary in production with no collector
     // attached costs nothing and creates nothing.
-    const std::string shm = unique_shm_name("early");
+    const scoped_shm_name shm("early");
 
     const int rc = run_producer(shm, kPointA, 100);
     EXPECT_NE(rc, 0) << "the producer should report that no collector was there";
@@ -237,7 +239,7 @@ TEST(Shm, AProducerStartedBeforeTheCollectorRecordsNothingAndSaysSo) {
 }
 
 TEST(Shm, AttachingWithAMismatchedNameTableThrows) {
-    const std::string shm = unique_shm_name("badcfg");
+    const scoped_shm_name shm("badcfg");
 
     Collector collector;
     ASSERT_TRUE(collector.start(collector_config(shm)));
@@ -274,7 +276,8 @@ TEST(Shm, AnOverLongShmNameIsRefusedByName) {
     config ok           = quiet_config();
     ok.run_mode         = mode::shared_producer;
     ok.create_if_absent = true;
-    ok.shm_name         = unique_shm_name("edge");
+    const scoped_shm_name edge_name("edge");
+    ok.shm_name = edge_name;
     ASSERT_LE(ok.shm_name.size(), static_cast<size_t>(SLICK_PERFMON_SHM_NAME_MAX));
     Collector edge;
     EXPECT_TRUE(edge.start(ok)) << "a name inside the budget must open both segments";
@@ -303,7 +306,7 @@ TEST(Shm, UniqueShmNameStaysInsideThePlatformBudget) {
 
 TEST(Shm, AProducerCanCreateTheSegmentWhenAskedTo) {
     // The escape hatch for the reverse startup order.
-    const std::string shm = unique_shm_name("create");
+    const scoped_shm_name shm("create");
 
     Collector producer;
     config    cfg       = quiet_config();
@@ -337,13 +340,15 @@ constexpr std::string_view renamed(point_id p, uint8_t step) noexcept {
 
 }  // namespace
 
-TEST(Shm, ANameIsReusableWithADifferentConfigurationAfterShutdown) {
-    // Regression, POSIX: the control block segment was unmapped but never
-    // unlinked, so the name outlived the process that created it. A rerun with
-    // a different max_names then hit the peer-mismatch throw against nothing
-    // but its own corpse. On Windows the segment is refcounted by handle and
-    // this already held, which is precisely why it needed a test.
-    const std::string shm = unique_shm_name("reuse");
+TEST(Shm, ANameIsReusableWithADifferentConfigurationOnceRemoved) {
+    // A session's segments are never unlinked implicitly, so that a collector
+    // can restart under producers that are still running. The other side of
+    // that: on POSIX the name outlives the process that created it, bound to
+    // the settings it was created with, and a rerun with a different max_names
+    // is the peer mismatch it would be against a live block. Removing the name
+    // is what gives it a clean start. On Windows the segment went with its
+    // last handle and the removal is a no-op.
+    const scoped_shm_name shm("reuse");
 
     {
         Collector c;
@@ -352,6 +357,7 @@ TEST(Shm, ANameIsReusableWithADifferentConfigurationAfterShutdown) {
         ASSERT_TRUE(c.start(cfg));
         c.shutdown();
     }
+    Collector::remove_shm(shm);
 
     Collector second;
     config    cfg = collector_config(shm);
@@ -367,13 +373,19 @@ TEST(Shm, ACollectorRestartsOnTheSameNameWithADifferentCapacity) {
     // its own, and threw "Shared memory size mismatch" against nothing but
     // this Collector's own leftover. The test above uses two Collectors, so it
     // never had a retired ring in the way.
-    const std::string shm = unique_shm_name("recap");
+    //
+    // Freeing the retired ring is still what makes this work on Windows. On
+    // POSIX the segment is never unlinked implicitly, so a different capacity
+    // also needs the name removed first - while the retired ring is still
+    // mapped, which removal has to be safe against.
+    const scoped_shm_name shm("recap");
 
     Collector c;
     config    first     = collector_config(shm);
     first.queue_capacity = 1024;
     ASSERT_TRUE(c.start(first));
     c.shutdown();
+    Collector::remove_shm(shm);
 
     config second         = collector_config(shm);
     second.queue_capacity = 4096;
@@ -383,10 +395,11 @@ TEST(Shm, ACollectorRestartsOnTheSameNameWithADifferentCapacity) {
 
 TEST(Shm, ARestartedCollectorDrainsItsOwnSegment) {
     // The quieter half of the same bug: with an unchanged capacity the restart
-    // did not throw, it attached to the previous session's segment as a
-    // non-owner beside a freshly created control block. What has to hold is
-    // that a producer arriving after the restart lands where it is drained.
-    const std::string shm = unique_shm_name("redrain");
+    // does not throw. Whichever segment it ends up on - a fresh one, or the
+    // previous session's, which is the one it finds wherever that is still
+    // there - what has to hold is that a producer arriving after the restart
+    // lands where it is drained.
+    const scoped_shm_name shm("redrain");
 
     Collector c;
     ASSERT_TRUE(c.start(collector_config(shm)));
@@ -403,16 +416,19 @@ TEST(Shm, ARestartedCollectorDrainsItsOwnSegment) {
     c.shutdown();
 }
 
-TEST(Shm, AReusedNameDoesNotResurrectTheOldSessionsLabels) {
-    // The other half of the leak: a stale block kept its name table, so a rerun
-    // that renamed a point silently reported it under the previous run's label.
-    const std::string shm = unique_shm_name("relabel");
+TEST(Shm, ARemovedNameDoesNotResurrectTheOldSessionsLabels) {
+    // A block left in place keeps its name table - on purpose, for the sake of
+    // producers that outlive a collector. So a rerun that renames a point has
+    // to remove the name first, or it reports the point under the previous
+    // run's label: the first name published for a key wins.
+    const scoped_shm_name shm("relabel");
 
     {
         Collector c;
         ASSERT_TRUE(c.start(collector_config(shm)));  // publishes "feed"
         c.shutdown();
     }
+    Collector::remove_shm(shm);
 
     Collector second;
     config    cfg = collector_config(shm);
@@ -436,3 +452,151 @@ TEST(Shm, AReusedNameDoesNotResurrectTheOldSessionsLabels) {
     EXPECT_TRUE(found);
     second.shutdown();
 }
+
+namespace {
+
+/// Whether a session's ring segment exists. Attach-only: this constructor
+/// opens a segment that is there and throws when there is none, which is what
+/// a late producer relies on to learn that no collector is running.
+bool ring_exists(const std::string& shm) {
+    try {
+        sample_queue probe(shm.c_str());
+        return true;
+    } catch (const std::exception&) {
+        return false;
+    }
+}
+
+/// Whether a session's control block segment exists.
+bool control_block_exists(const std::string& shm) {
+    ControlBlockOwner probe;
+    return probe.attach_shared(shm + SLICK_PERFMON_META_SUFFIX, config{}.max_names);
+}
+
+constexpr std::string_view strategy_only(point_id p, uint8_t step) noexcept {
+    return p == kPointB && step == kBeginStep ? "strategy" : std::string_view{};
+}
+
+}  // namespace
+
+TEST(Shm, AShmTestLeavesNoSegmentBehind) {
+    // Regression: nothing in the library unlinks a segment - slick-queue
+    // stopped doing it for the ring in 2.3.0, and the Collector does not do it
+    // for either - so on POSIX every test in this file left its segments in
+    // /dev/shm for good. scoped_shm_name removes them explicitly; this is the
+    // check that it does.
+    //
+    // On Windows a segment goes with its last handle, so this holds there with
+    // or without the guard. It is Linux and macOS it is here for.
+    std::string name;
+    {
+        const scoped_shm_name shm("gone");
+        name = shm.str();
+
+        Collector c;
+        ASSERT_TRUE(c.start(collector_config(shm)));
+        c.shutdown();
+    }
+
+    EXPECT_FALSE(ring_exists(name))
+        << "the ring segment '" << name << "' outlived the test that created it";
+    EXPECT_FALSE(control_block_exists(name))
+        << "the control block of '" << name << "' outlived the test that created it";
+}
+
+TEST(Shm, ACollectorRestartKeepsARunningProducersSegmentsAndNames) {
+    // What keeping the segments is for. A collector that unlinked them on its
+    // way out left every producer still running attached to segments nobody
+    // would open again: the next collector made fresh ones under the same
+    // name, drained nothing those producers stamped, and had none of the
+    // labels they published. Here the producer outlives the collector, and the
+    // collector that replaces it has to find both the stamps and the names.
+    const scoped_shm_name shm("survive");
+
+    auto first = std::make_unique<Collector>();
+    ASSERT_TRUE(first->start(collector_config(shm)));
+
+    // The producer names kPointB itself. The replacement collector below is
+    // given no name table at all, so the label can only reach its report from
+    // the block this producer published into.
+    Collector producer;
+    config    pcfg   = quiet_config();
+    pcfg.run_mode    = mode::shared_producer;
+    pcfg.shm_name    = shm;
+    pcfg.point_count = kPointB + 1;
+    pcfg.name_of     = &strategy_only;
+    ASSERT_TRUE(producer.start(pcfg));
+
+    // The mapping the producer attached while the first collector was alive,
+    // and the only one it will ever have: a running producer does not reopen
+    // the segment because the collector changed.
+    sample_queue* const kept = producer.ring();
+    ASSERT_NE(kept, nullptr);
+
+    first->shutdown();
+    first.reset();  // the first collector is gone, mappings and all
+
+    Collector second;
+    config    scfg   = collector_config(shm);
+    scfg.point_count = 0;
+    scfg.name_of     = nullptr;
+    ASSERT_TRUE(second.start(scfg));
+    ASSERT_NE(second.ring(), kept) << "the replacement has a mapping of its own";
+
+    // Published through the producer's mapping explicitly, with the stamp the
+    // hot path itself uses. begin() and end() would not do: this process has
+    // one hot-path pointer, second.start() has just pointed it at the
+    // replacement's own mapping, and stamps sent that way arrive whatever
+    // segment the replacement opened - a fresh one included, which is exactly
+    // the failure this test exists to catch. Only what goes in through `kept`
+    // says whether the two are still the same segment.
+    constexpr int kSpans = 300;
+    for (int i = 0; i < kSpans; ++i) {
+        const span_seq seq = static_cast<span_seq>(i + 1);
+        detail::stamp_into<true>(*kept, kPointB, make_event(kBeginStep, seq));
+        detail::stamp_into<false>(*kept, kPointB, make_event(kEndStep, seq));
+    }
+
+    const stats total = second.snapshot_total(kPointB);
+    EXPECT_EQ(total.count, kSpans) << "the restarted collector is not draining the ring "
+                                      "the producer is still attached to";
+
+    bool found = false;
+    for (const StageReport& r : second.reports()) {
+        if (r.point == kPointB) {
+            EXPECT_EQ(r.point_name, "strategy")
+                << "the name the producer published did not survive the restart";
+            found = true;
+        }
+    }
+    EXPECT_TRUE(found);
+
+    second.shutdown();
+    producer.shutdown();
+}
+
+#if !defined(_WIN32)
+
+TEST(Shm, SegmentsOutliveTheirCollectorUntilRemoved) {
+    // The POSIX half of the contract, stated on its own: nothing a Collector
+    // does on the way out unlinks anything, and remove_shm() is what does.
+    // Not on Windows, where a segment cannot outlive its last handle and there
+    // is no name to remove.
+    const scoped_shm_name shm("outlive");
+
+    {
+        Collector c;
+        ASSERT_TRUE(c.start(collector_config(shm)));
+        c.shutdown();
+    }
+    EXPECT_TRUE(ring_exists(shm)) << "the ring was unlinked by its Collector";
+    EXPECT_TRUE(control_block_exists(shm)) << "the control block was unlinked by its Collector";
+
+    Collector::remove_shm(shm);
+    EXPECT_FALSE(ring_exists(shm));
+    EXPECT_FALSE(control_block_exists(shm));
+
+    Collector::remove_shm(shm);  // a name that is not there is not an error
+}
+
+#endif  // !_WIN32

@@ -7,6 +7,7 @@
 
 #include <slick/perfmon/control_block.hpp>
 
+#include "shm_test_support.hpp"
 #include "test_support.hpp"
 
 #include <gtest/gtest.h>
@@ -172,7 +173,7 @@ TEST(Names, AttachingASegmentThatDoesNotExistFailsQuietly) {
 }
 
 TEST(Names, SharedSegmentsAgreeAcrossOwners) {
-    const std::string name = unique_shm_name("names");
+    const scoped_shm_name name("names");
 
     ControlBlockOwner creator;
     ASSERT_TRUE(creator.create_shared(name, 64));
@@ -189,7 +190,7 @@ TEST(Names, SharedSegmentsAgreeAcrossOwners) {
 TEST(Names, AttachingWithAMismatchedCapacityThrows) {
     // A peer configured differently would read the name table at the wrong
     // stride, so this has to fail loudly rather than return nonsense.
-    const std::string name = unique_shm_name("mismatch");
+    const scoped_shm_name name("mismatch");
 
     ControlBlockOwner creator;
     ASSERT_TRUE(creator.create_shared(name, 64));
@@ -216,7 +217,7 @@ TEST(Names, ClaimedNamesCountsWhatHasBeenPublished) {
 }
 
 TEST(Names, ClaimedNamesGrowsWhenAPeerPublishesLater) {
-    const std::string name = slick::perfmon::test::unique_shm_name("claimed");
+    const scoped_shm_name name("claimed");
 
     ControlBlockOwner collector;
     ASSERT_TRUE(collector.create_shared(name, 64));
@@ -260,7 +261,7 @@ TEST(Names, GenerationMovesOnlyWhenANameBecomesReadable) {
 }
 
 TEST(Names, GenerationSeesAPeerPublishingLater) {
-    const std::string name = unique_shm_name("generation");
+    const scoped_shm_name name("generation");
 
     ControlBlockOwner collector;
     ASSERT_TRUE(collector.create_shared(name, 64));

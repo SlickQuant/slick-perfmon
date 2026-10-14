@@ -163,6 +163,14 @@ public:
 
     /// Create (or adopt) the segment. Used by a collector, and by a producer
     /// with config::create_if_absent.
+    ///
+    /// Adopting is the ordinary case for a collector that restarts: the block
+    /// is never unlinked on the way out (see reset()), so on POSIX the one the
+    /// previous session made is still there, and where a producer is still
+    /// attached it is still there on Windows too. It is taken as it stands,
+    /// names included - which is the point, since those are the names of
+    /// producers that are still running - and a different max_names is the
+    /// same peer mismatch it would be against a live one.
     bool create_shared(const std::string& shm_name, uint32_t max_names) {
         const size_t bytes = control_block::bytes_for(max_names);
         shm_ = std::make_unique<slick::shm::shared_memory>(
@@ -174,13 +182,7 @@ public:
         }
         block_ = static_cast<control_block*>(shm_->data());
 
-        // Recorded before anything below can throw: validate() rejects a
-        // mismatched peer by throwing, and a segment we created still has to be
-        // unlinked on the way out.
-        shm_name_ = shm_name;
-        owns_shm_ = shm_->is_creator();
-
-        if (owns_shm_) {
+        if (shm_->is_creator()) {
             initialise(max_names);
         } else {
             if (!await_ready()) {
@@ -203,9 +205,7 @@ public:
             shm_.reset();
             return false;
         }
-        block_    = static_cast<control_block*>(shm_->data());
-        shm_name_ = shm_name;
-        owns_shm_ = false;  // somebody else created it; never unlink it here
+        block_ = static_cast<control_block*>(shm_->data());
         if (!await_ready()) {
             reset();
             return false;
@@ -226,29 +226,27 @@ public:
     /// Release the segment (or the heap block) and go back to the unstarted
     /// state, so a Collector can be restarted with a different config.
     ///
-    /// A segment we created is also unlinked. On POSIX a shm object outlives
-    /// every process that mapped it, so without this a name could only ever be
-    /// used once per boot with the settings it was first created under: a rerun
-    /// would adopt the old block and silently keep its stale labels and
-    /// calibration, and a changed max_names would be rejected as a peer
-    /// mismatch. On Windows the segment is refcounted by handle and remove() is
-    /// a documented no-op, so this is one code path rather than two.
+    /// The segment is unmapped and nothing more: its name is never unlinked
+    /// here, not even by the owner that created it. This block cannot know
+    /// whether a producer is still attached, and unlinking under one would
+    /// leave it publishing names into a segment nobody will open again while
+    /// the next collector quietly made a fresh, empty one under the same name.
+    /// So the name table survives a collector restart, and a producer that
+    /// kept running through it keeps its labels. It is the rule slick-queue
+    /// has followed for the sample ring since 2.3.0, so the two segments of a
+    /// session stay or go together.
     ///
-    /// The unlink matches what slick-queue already does for the sample ring it
-    /// owns, so the two segments of a session appear and disappear together.
-    /// A producer that created them under config::create_if_absent therefore
-    /// takes both with it when it exits - which is the same trade the escape
-    /// hatch already made for the ring.
+    /// What that costs is on POSIX, where a shm object outlives every process
+    /// that mapped it: a name stays bound to the settings and labels it was
+    /// first created with until somebody removes it. A rerun adopts the old
+    /// block, keeps the labels already published - the first name for a key
+    /// wins, and a different one is counted as a conflict - and is refused as
+    /// a peer mismatch if max_names changed. Removing the name is the call of
+    /// whoever coordinates the session: Collector::remove_shm(). On Windows a
+    /// segment is freed with its last handle, so it only persists while a peer
+    /// is still attached.
     void reset() noexcept {
-        const bool  own = owns_shm_;
-        std::string name;
-        name.swap(shm_name_);
-        owns_shm_ = false;
-
-        shm_.reset();  // unmap before unlinking, so the name goes last
-        if (own && !name.empty()) {
-            slick::shm::shared_memory::remove(name.c_str());
-        }
+        shm_.reset();
 
         heap_.clear();
         heap_.shrink_to_fit();
@@ -515,8 +513,6 @@ private:
     std::unique_ptr<slick::shm::shared_memory> shm_;
     std::vector<std::byte>                     heap_;
     control_block*                             block_ = nullptr;
-    std::string                                shm_name_;
-    bool                                       owns_shm_ = false;
 };
 
 }  // namespace slick::perfmon

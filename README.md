@@ -327,13 +327,35 @@ cfg.path     = "";               // a producer writes no files
 slick::perfmon::collector::instance().start(cfg);
 ```
 
-If no collector is running, `start()` returns `false`, the process records nothing, and
-every stamp costs nothing. That is the safe default for a binary shipped to production
-with instrumentation compiled in — no segment is created, no data is buffered, nothing
-is silently lost. Set `config::create_if_absent` if you need the reverse order.
+If the segments are not there, `start()` returns `false`, the process records nothing,
+and every stamp costs nothing. That is the safe default for a binary shipped to
+production with instrumentation compiled in — no segment is created, no data is
+buffered, nothing is silently lost. Set `config::create_if_absent` if you need the
+reverse order.
 
 The collector binary knows nothing about your points and does not need to: producers
 publish their names into the segment at startup and the collector reads them back.
+
+**The collector can be restarted under running producers.** It never removes the
+segments on its way out, so the one that replaces it opens the same ring and the same
+name table, and a producer that kept running through the restart is collected again
+under the names it published — nothing has to be restarted with it. A collector reads
+from the moment it starts, so whatever was stamped while none was running is not
+collected, and a span that straddles the restart shows up as an `orphan`.
+
+Two consequences of the segments staying, both on POSIX (on Windows they vanish with
+the last process attached):
+
+- A producer started while **no collector is running** still attaches if an earlier
+  session left its segments behind. `start()` returns `true` and it stamps at full cost
+  into a ring nothing drains until a collector comes back. "Costs nothing without a
+  collector" holds only for a name with no segments.
+- A name keeps the `queue_capacity`, `max_names` and labels it was created with. To
+  change any of them — or simply to clean up — remove it first:
+
+```cpp
+slick::perfmon::collector::remove_shm("trading_perf");   // ring + control block
+```
 
 ### Environment overrides
 
@@ -387,6 +409,7 @@ class Collector {
     bool start(config cfg = {});
     void shutdown();
     bool running() const noexcept;
+    static void remove_shm(const std::string& shm_name) noexcept;   // never implicit
     void set_enabled(bool) noexcept;                 // live on/off switch
     bool enabled() const noexcept;
     void flush();
@@ -454,9 +477,23 @@ class Collector {
 - **`shutdown()` must not race with active instrumentation.** Retired rings are held
   until the `Collector` is destroyed, so a stamp in flight across `shutdown()` is safe;
   one in flight across `~Collector` is not. A shared ring is the exception: restarting on
-  the same `shm_name` frees the retired one first, since it would otherwise keep the name
-  and the new session would open the old segment (throwing on a changed
-  `queue_capacity`). Only a stamp still in flight across that whole restart is exposed.
+  the same `shm_name` drops the retired mapping first, so the object is not left holding
+  a second mapping of a segment it is about to open again. Only a stamp still in flight
+  across that whole restart is exposed.
+- **Shared segments are never removed implicitly.** Neither `shutdown()` nor
+  `~Collector` unlinks the ring (`<shm_name>`) or the control block (`<shm_name>.meta`),
+  and since 2.3.0 slick-queue does not either: none of them can know whether a producer
+  is still attached. That is what lets a collector restart under running producers — see
+  [Out-of-process collection](#out-of-process-collection). The cost is on POSIX, where a
+  segment outlives every process that mapped it, so after a session `/dev/shm/<shm_name>`
+  and `/dev/shm/<shm_name>.meta` are still there and the name stays bound to what it was
+  created with: a later session with a different `queue_capacity` throws "Shared memory
+  size mismatch", one with a different `max_names` throws a control-block mismatch, and a
+  point keeps the label first published for it (a different one is counted in
+  `name_conflicts()`). `Collector::remove_shm("<shm_name>")` removes both segments and
+  gives the name a clean start; call it from whatever coordinates the session, once no
+  peer will attach again. On Windows a segment is freed with its last handle, so it
+  persists only while some process is still attached and there is nothing to remove.
 - **Percentiles are approximate**, with a bounded relative error of ~3% at the default
   histogram precision. A percentile is the nearest rank - the smallest sample with at
   least p% of them at or below it, with no interpolation - so `p51` of two samples is the

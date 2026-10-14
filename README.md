@@ -11,7 +11,8 @@ A header-only C++20 latency measurement library for code that cannot afford to b
 measured. The instrumented thread reads the TSC and publishes 16 bytes to a lock-free
 MPMC ring. Everything else — pairing, min/max/mean, Welford variance, histogram
 percentiles, cycles-to-nanoseconds, formatting, file I/O — happens somewhere else, on a
-collector thread or, in production, in a separate process.
+collector thread or, in production, in a separate process. The same 16 bytes carry plain
+values too — a queue depth, a batch size — with no timestamp read at all.
 
 ## How it works
 
@@ -35,6 +36,10 @@ A span is `begin → [step …] → end`. Each call publishes one raw timestamp;
 reconstructs the span and reports **every stage transition plus the end-to-end total**
 from the same events.
 
+A value sample, `value(point, n)`, travels the same road without the timestamp: the
+16-byte event carries the number itself, nothing is paired, and the collector reports
+its distribution in the same files. See [Record a value](#record-a-value).
+
 ## Features
 
 - **A fixed ~200 cycles per stamp, and nothing else, ever.** One serialized TSC read,
@@ -51,7 +56,8 @@ from the same events.
   measurement in itself — a queue depth, a batch size, a byte count — with no begin, no
   end and no timestamp, for ~30 cycles. It gets the same statistics, in the same CSV.
 - **Out-of-process collection.** The measured process does zero analysis and no file
-  I/O, and its numbers survive its own crash.
+  I/O, and its numbers survive its own crash. The collector can be restarted under
+  running producers without restarting them.
 - **Compiles to nothing.** `SLICK_PERFMON_ENABLED=0` removes every stamp, the ring and
   the collector thread; instrumented source needs no `#ifdef` of its own.
 - **Honest about its own failure modes.** Ring overflow, unmatched stamps, backwards
@@ -67,7 +73,7 @@ from the same events.
   is correct but roughly an order of magnitude more expensive, and the compiler says so.
 - An invariant TSC for trustworthy numbers. The library probes for one and shouts in the
   summary if it is missing.
-- [slick-queue](https://github.com/SlickQuant/slick-queue) 2.1.0 and
+- [slick-queue](https://github.com/SlickQuant/slick-queue) 2.3.0 and
   [slick-shm](https://github.com/SlickQuant/slick-shm) 0.1.6 — found with
   `find_package`, or fetched by the build if they are not installed
 
@@ -91,7 +97,7 @@ include(FetchContent)
 FetchContent_Declare(
     slick-perfmon
     GIT_REPOSITORY https://github.com/SlickQuant/slick-perfmon.git
-    GIT_TAG v0.2.0
+    GIT_TAG v0.3.0
 )
 FetchContent_MakeAvailable(slick-perfmon)
 target_link_libraries(main PRIVATE slick::perfmon)

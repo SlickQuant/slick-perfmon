@@ -1,5 +1,60 @@
 # Changelog
 
+## v0.3.0 - 10-13-2026
+
+Several changes here are breaking: the entries in bold under Changed.
+
+### Added
+
+- Value samples. `value(point, v)`, or `SLICK_PERFMON_VALUE`, records an unsigned 64-bit
+  number that is a measurement in itself — a queue depth, a batch size — with no begin,
+  no end and no timestamp. It reuses the 16-byte ring record and skips the TSC read, at
+  ~29 cycles against ~196 for a stamp. The backend reports the same statistics as for a
+  latency but as recorded: no unit conversion and no overhead subtraction.
+- `Collector::snapshot_value()` for a value point's statistics, and `StageReport::value`
+  to tell its row from a latency row in `reports()`.
+- A `kind` column in the CSV, `latency` or `value`, saying what a row's figure columns
+  hold. Value points are rows of the same CSV and the same summary table, under the
+  stage name `value`; in the summary their figures print as bare numbers.
+- `Collector::remove_shm(name)`, which removes both shared segments of a session. It is
+  now the only thing that does — see below.
+- `kValueStep`, `kMaxSpanStep` and `is_value_event()` beside the existing step constants.
+- Benchmark cases for a value sample and for accumulating a drained value.
+
+### Changed
+
+- **Step `0xFE` is reserved** as the value marker. Span steps are `0x01..0xFD`; a
+  `step(point, 0xFE)` is read back as a value sample.
+- **The shared-memory layout version is 4**, because an event with step `0xFE` now means
+  something else. A collector and a producer built either side of this release refuse to
+  share a segment; rebuild them together.
+- **The CSV header has changed** — `kind` follows `stage` — and anything reading the file
+  by column position sees the columns from `count` onward move one place right. A CSV
+  written by an earlier version is not appended to: `start()` throws
+  `std::invalid_argument`, since rows in such a file cannot be told from value samples.
+  Use a new `config::path` or move the old file aside.
+- **The stage label `value` is reserved.** A `name_of` that returns it for a step of a
+  span is treated as returning no name, and the stage gets the generated
+  `step_<a>-><b>` label.
+- **Shared segments are never removed implicitly.** Neither `shutdown()` nor
+  `~Collector` unlinks the ring or the control block, so a collector restarted under
+  running producers reopens the same segments and reports them under the names they
+  published. On POSIX, where a segment outlives every process that mapped it, this means:
+  - `/dev/shm/<shm_name>` and `<shm_name>.meta` remain after a session until
+    `Collector::remove_shm()` is called;
+  - a later session on the same name with a different `queue_capacity` or `max_names`
+    throws a mismatch, and a renamed point keeps its first label, until the name is
+    removed — including the same-`Collector` restart with a new `queue_capacity` that
+    v0.2.0 made work;
+  - a producer started with no collector running attaches to segments an earlier session
+    left behind, returns `true` from `start()` and stamps at full cost into a ring
+    nothing drains. "Costs nothing without a collector" holds only for a name with no
+    segments.
+
+  On Windows a segment is freed with its last handle, so it persists only while some
+  process is attached.
+- slick-queue 2.3.0 is now the minimum, for the build and for the installed package.
+
 ## v0.2.0 - 10-04-2026
 
 ### Changed

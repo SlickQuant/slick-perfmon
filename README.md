@@ -615,7 +615,8 @@ producer that dies leaves enough behind for the collector to reclaim the ring.
 **Merge.** Each ring is in timestamp order already, so the collector merges them with a
 small heap, pairing a stamp only once it is 2 ms old. The hold-back lets a span cross
 threads: a begin stamped just before a pass may not be visible yet, and pairing its end
-first would orphan it. The ring keeps its newest `capacity - 1` samples, because
+first would orphan it. Stamps from two rings with the same timestamp, which a coarse
+clock makes common, go in whichever order pairs cleanly. The ring keeps its newest `capacity - 1` samples, because
 after copying a chunk the collector reads the head again and discards whatever the
 producer may have reached meanwhile, counting it as `dropped`.
 

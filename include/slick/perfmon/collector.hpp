@@ -1236,8 +1236,7 @@ private:
         } else if (!sources_.empty()) {
             // Min-heap on each source's next timestamp.
             auto later = [this](uint32_t a, uint32_t b) {
-                return sources_[a].data[sources_[a].pos].timestamp >
-                       sources_[b].data[sources_[b].pos].timestamp;
+                return source_head(a).timestamp > source_head(b).timestamp;
             };
             heap_.clear();
             for (uint32_t i = 0; i < sources_.size(); ++i) {
@@ -1246,6 +1245,7 @@ private:
             std::make_heap(heap_.begin(), heap_.end(), later);
             while (!heap_.empty()) {
                 std::pop_heap(heap_.begin(), heap_.end(), later);
+                prefer_clean_tie();
                 MergeSource& src = sources_[heap_.back()];
                 pairer_.on_event(src.data[src.pos++]);
                 if (next_stamp(src, watermark, progressed)) {
@@ -1265,6 +1265,37 @@ private:
         }
         release_retired_rings();
         return progressed;
+    }
+
+    const sample& source_head(uint32_t i) const noexcept {
+        return sources_[i].data[sources_[i].pos];
+    }
+
+    /**
+     * @brief On a timestamp tie, move a stamp that pairs cleanly to heap_.back().
+     *
+     * Called after pop_heap, with the earliest stamp at back() and the rest a
+     * heap. Tied stamps are ones the clock cannot order, which a coarse clock
+     * makes common: a begin and its end on another thread can share a tick.
+     * Every tied source is a candidate, not just the root: two ends can tie
+     * with a third ring holding both their begins. The scan runs only on a tie
+     * whose earliest stamp would not pair, and swapping in a candidate with the
+     * same timestamp leaves the heap valid.
+     */
+    void prefer_clean_tie() {
+        const size_t  n = heap_.size() - 1;
+        const sample& a = source_head(heap_[n]);
+        if (n == 0 || source_head(heap_[0]).timestamp != a.timestamp ||
+            pairer_.pairs_cleanly(a)) {
+            return;
+        }
+        for (size_t i = 0; i < n; ++i) {
+            const sample& b = source_head(heap_[i]);
+            if (b.timestamp == a.timestamp && pairer_.pairs_cleanly(b)) {
+                std::swap(heap_[i], heap_[n]);
+                return;
+            }
+        }
     }
 
     /**

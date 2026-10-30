@@ -75,6 +75,10 @@ public:
     bool   full() const noexcept { return size_ >= max_entries_; }
 
     V* find(uint64_t key) noexcept {
+        return const_cast<V*>(static_cast<const open_map&>(*this).find(key));
+    }
+
+    const V* find(uint64_t key) const noexcept {
         if (used_.empty()) {
             return nullptr;
         }

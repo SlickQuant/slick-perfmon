@@ -12,6 +12,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -177,8 +178,21 @@ TEST_F(ScopedTest, NestingDifferentPointsRecordsBoth) {
     EXPECT_EQ(completed(pt::alpha), 1u);
     EXPECT_EQ(completed(pt::beta), 1u);
 
-    // True nesting: the inner span is contained by the outer one.
-    EXPECT_LE(total(pt::beta).mean, total(pt::alpha).mean);
+    // True nesting: the inner span is contained by the outer one. Both come
+    // from one flush. Each flush converts at its own refined clock rate, so on a
+    // coarse clock, where both spans can be one tick, two flushes could put the
+    // equal figures either way round.
+    const std::vector<StageReport> rows = collector_.reports();
+    const auto total_row = [&](pt p) {
+        return std::find_if(rows.begin(), rows.end(), [&](const StageReport& r) {
+            return r.point == to_point(p) && r.stage_name == "total";
+        });
+    };
+    const auto inner = total_row(pt::beta);
+    const auto outer = total_row(pt::alpha);
+    ASSERT_NE(inner, rows.end());
+    ASSERT_NE(outer, rows.end());
+    EXPECT_LE(inner->cumulative.mean, outer->cumulative.mean);
 }
 
 TEST_F(ScopedTest, NestingTheSamePointAndSeqIsTheAbandonedCase) {

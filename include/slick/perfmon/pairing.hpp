@@ -192,6 +192,14 @@ public:
         }
     }
 
+    /// Whether pairing @p s next would be clean: a begin with nothing open on
+    /// its span, or a step or end with its span open. The merge asks this when
+    /// stamps from two rings share a timestamp and the clock cannot order them.
+    bool pairs_cleanly(const sample& s) const noexcept {
+        const bool open = spans_.find(span_key(s.point, seq_of(s.event))) != nullptr;
+        return (step_of(s.event) == kBeginStep) != open;
+    }
+
     /// Evict spans untouched for longer than `max_age_cycles`. Without this a
     /// `seq` whose end never arrives - a crashed producer, an order that was
     /// never acked - would hold its slot for the life of the process.

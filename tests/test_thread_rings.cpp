@@ -390,6 +390,60 @@ TEST(ThreadRings, ASnapshotDuringCrossThreadSpansStaysExact) {
     c.shutdown();
 }
 
+TEST(ThreadRings, StampsThatTieAcrossRingsPairCleanly) {
+    // Regression: on a coarse clock a begin and its end on another thread can
+    // share a tick, and the merge broke the tie by heap position, pairing the
+    // end first: an orphan, then an abandoned span. Two spans, every stamp on
+    // one tick. Heap order on a tie is the library's choice, so both layouts:
+    // one of them takes the end first unless the tie is handled.
+    for (const bool ends_low : {true, false}) {
+        SCOPED_TRACE(ends_low ? "ends in the lower ring" : "ends in the higher ring");
+        Collector c;
+        ASSERT_TRUE(c.start(ring_config(8)));
+        detail::ring_writer closer;
+        detail::ring_writer opener;
+        closer.attach(c.session()->rings.view(ends_low ? 6 : 7));
+        opener.attach(c.session()->rings.view(ends_low ? 7 : 6));
+
+        const uint64_t t = detail::rdtsc_step();
+        opener.publish(t, kSpan, make_event(kBeginStep));
+        closer.publish(t, kSpan, make_event(kEndStep));
+        opener.publish(t, kSpan, make_event(kBeginStep));
+        closer.publish(t, kSpan, make_event(kEndStep));
+
+        expect_clean(c.snapshot_total(kSpan), 2);
+        c.shutdown();
+    }
+}
+
+TEST(ThreadRings, StampsThatTieAcrossThreeRingsPairCleanly) {
+    // Regression: the tie check looked only at the next source in the heap.
+    // Two ends tied with a third ring holding both their begins, so it found
+    // the other end and paired one as an orphan. The begins' ring takes each
+    // position in turn: whatever order the heap leaves tied sources in, one
+    // layout puts both ends ahead of it.
+    for (const uint32_t opens : {5u, 6u, 7u}) {
+        SCOPED_TRACE(opens);
+        Collector c;
+        ASSERT_TRUE(c.start(ring_config(8)));
+        detail::ring_writer opener;
+        detail::ring_writer closer1;
+        detail::ring_writer closer2;
+        opener.attach(c.session()->rings.view(opens));
+        closer1.attach(c.session()->rings.view(opens == 5u ? 6u : 5u));
+        closer2.attach(c.session()->rings.view(opens == 7u ? 6u : 7u));
+
+        const uint64_t t = detail::rdtsc_step();
+        opener.publish(t, kSpan, make_event(kBeginStep, 1));
+        opener.publish(t, kSpan, make_event(kBeginStep, 2));
+        closer1.publish(t, kSpan, make_event(kEndStep, 1));
+        closer2.publish(t, kSpan, make_event(kEndStep, 2));
+
+        expect_clean(c.snapshot_total(kSpan), 2);
+        c.shutdown();
+    }
+}
+
 TEST(ThreadRings, ATableAnotherModuleAttachedIsNotReused) {
     // Regression: a local restart took the previous table back, but a DLL that
     // attach()ed to the previous session and did not attach again keeps its

@@ -2463,6 +2463,8 @@ public:
     uint64_t last_flush_cycles() const noexcept { return 0; }
     size_t   peak_open_spans() const noexcept { return 0; }
     uint32_t name_conflicts() const noexcept { return 0; }
+
+    const detail::session* session() const noexcept { return nullptr; }
 };
 
 using collector = Collector;

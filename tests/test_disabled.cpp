@@ -48,6 +48,7 @@ TEST(Disabled, EveryEntryPointStillCompiles) {
     value(pt::beta, 1234u);
     stamp<true>(0, make_event(kBeginStep));
     attach(nullptr);
+    prepare_thread();
     SUCCEED();
 }
 
@@ -109,6 +110,10 @@ TEST(Disabled, TheCollectorApiIsPresentButInert) {
     EXPECT_TRUE(c.reports().empty());
     EXPECT_DOUBLE_EQ(c.tsc_hz(), 0.0);
     EXPECT_EQ(c.overhead_cycles(), 0u);
+
+    // The DLL hookup from the README: a module attaches to the host's session.
+    EXPECT_EQ(c.session(), nullptr);
+    attach(c.session());
 
     std::ostringstream os;
     c.dump_summary(os);

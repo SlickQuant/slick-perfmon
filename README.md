@@ -99,7 +99,7 @@ include(FetchContent)
 FetchContent_Declare(
     slick-perfmon
     GIT_REPOSITORY https://github.com/SlickQuant/slick-perfmon.git
-    GIT_TAG v0.3.0
+    GIT_TAG v0.4.0
 )
 FetchContent_MakeAvailable(slick-perfmon)
 target_link_libraries(main PRIVATE slick::perfmon)
@@ -293,7 +293,8 @@ on another.
   collector pass (up to ~15.6 ms on Windows when idle). The default 65536 covers ~3.5 M
   stamps/s per thread; beyond that, overwritten samples count as `dropped`.
 - `prepare_thread()` claims the calling thread's ring and faults its pages in, so neither
-  lands inside the first measurement. `start()` does it for its own thread.
+  lands inside the first measurement. `start()` does it for the calling thread, except
+  in `mode::shared_collector`, whose thread usually never stamps.
 - The rings take `max_thread_rings × thread_ring_capacity × 16` bytes of address space
   (64 MiB by default, at most 2 GiB), touched only as they are used. In the shared modes
   they live in the `.meta` segment, and a producer must use the collector's two
@@ -811,7 +812,7 @@ its cost in a tight loop with the cache hot. 51 is one call on its own after a g
 through a fenced bracket that rounds to the counter's 33-cycle tick, so cache misses and
 that rounding are in it.
 
-| Threads | publish mean, v0.3.0 → now | publish p50 | span overhead mean | span overhead p99 |
+| Threads | publish mean, v0.3.0 → v0.4.0 | publish p50 | span overhead mean | span overhead p99 |
 |---|---|---|---|---|
 | 1 | 127 → 51 | 66 → 33 | 506 → 397 | 760 → 504 |
 | 2 | 303 → 52 | 264 → 33 | 660 → 407 | 824 → 504 |

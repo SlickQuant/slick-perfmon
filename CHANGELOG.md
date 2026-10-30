@@ -1,6 +1,6 @@
 # Changelog
 
-## v0.4.0 - Unreleased
+## v0.4.0 - 10-30-2026
 
 Breaking changes are in bold under Changed.
 
@@ -9,11 +9,13 @@ Breaking changes are in bold under Changed.
 - Per-thread rings. Each instrumenting thread claims a single-producer ring on its first
   stamp, so stamps no longer contend: a publish is three relaxed stores and a release
   store, with no read-modify-write. The collector merges the rings by timestamp, so spans
-  still cross threads, DLLs and processes. Threads past the cap use the shared ring.
-- `config::max_thread_rings` (64; 0 sends every thread through the shared ring) and
-  `config::thread_ring_capacity` (65536 slots). Together they are capped at 2 GiB.
+  still cross threads, DLLs and processes. Threads past the cap use the shared ring, and
+  a thread that exits hands its ring to the next new one.
+- `config::max_thread_rings` (64, at most 4096; 0 sends every thread through the shared
+  ring) and `config::thread_ring_capacity` (65536 slots, a power of two). Together they
+  are capped at 2 GiB.
 - `prepare_thread()`, which claims the calling thread's ring and faults its pages in.
-  `start()` does it for its own thread.
+  `start()` does it for the calling thread, except in `mode::shared_collector`.
 - `Collector::session()`, the handle `attach()` takes.
 - The collector frees rings held by a producer process that died.
 - `--thread-rings` and `--thread-ring-capacity` on `slick_perfmon_collector`.
@@ -30,12 +32,15 @@ Breaking changes are in bold under Changed.
 - **The shared-memory layout version is 5.** The thread rings live in the `.meta` segment
   after the names. Rebuild collectors and producers together; a producer must use the
   collector's thread ring settings or `start()` throws.
+- The rings take `max_thread_rings × thread_ring_capacity × 16` bytes of address space,
+  64 MiB by default, touched only as they are used.
 - Stamps are paired once they are 2 ms old, so periodic rows trail by that much.
-  `flush()`, `snapshot()` and `shutdown()` wait at least ~20 µs instead and pair
-  everything stamped before the call. A thread that keeps stamping cannot hold them up.
+  `flush()`, `shutdown()` and the calls that flush first (`snapshot()`, `reports()`,
+  `dump_summary()`) wait at least ~20 µs instead and pair everything stamped before the
+  call. A thread that keeps stamping cannot hold them up.
 - The collector waits at least 50 µs between passes that found work.
 - A stamp costs ~172 cycles (was ~205) and a value sample ~16 (was ~29). At 8 threads a
-  publish costs ~68 cycles where it cost ~429.
+  publish costs ~68 cycles where it cost ~429. `overhead_cycles()` reads ~130 (was ~165).
 - With rings on, stamps from threads past the cap are ordered by timestamp, so a
   backwards TSC on one of them reads as `orphan` rather than `invalid`.
 

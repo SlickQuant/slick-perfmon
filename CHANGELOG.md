@@ -39,6 +39,11 @@ Breaking changes are in bold under Changed.
 - With rings on, stamps from threads past the cap are ordered by timestamp, so a
   backwards TSC on one of them reads as `orphan` rather than `invalid`.
 
+### Fixed
+
+- A span still open at `shutdown()` was dropped without a count unless it was older than
+  `stalled_sample_timeout`. It now counts as `abandoned`.
+
 ## v0.3.0 - 10-13-2026
 
 Several changes here are breaking: the entries in bold under Changed.

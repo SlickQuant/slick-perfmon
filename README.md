@@ -198,7 +198,7 @@ Everything else has a default that gives a working in-process session:
 | `poll_interval` | 1 ms | collector sleep once the ring is empty |
 | `csv_flush_interval` | 0 | 0 pushes the stream every interval; higher defers it |
 | `calibration_time` | 10 ms | TSC calibration window inside `start()` |
-| `stalled_sample_timeout` | 5 s | age at which an open span is abandoned and a ring hole stepped over; at shutdown holes get at most 100 ms in total |
+| `stalled_sample_timeout` | 5 s | age at which an open span is abandoned and a ring hole stepped over; at shutdown every open span is abandoned and holes get at most 100 ms in total |
 | `queue_capacity` | 65536 | shared ring slots, for threads without a ring of their own; a power of two |
 | `max_thread_rings` | 64 | per-thread rings; 0 sends every thread through the shared ring |
 | `thread_ring_capacity` | 65536 | slots per thread ring; a power of two, 16 bytes each |
@@ -582,7 +582,8 @@ class Collector {
   and counted in `stalled`, so the events behind them still reach the last report and the
   loss is visible in it. The drain stops at what was reserved when `shutdown()` began: a
   producer in another process is not detached by it, and one that keeps publishing does
-  not hold shutdown open.
+  not hold shutdown open. Its spans still open at that point count as `abandoned`, which
+  in that case is not a fault.
 - **Running at `max_open_spans` is a sustained cost, not a one-off.** Once the table is
   full it stays full — every `begin` evicts one span and inserts one — so eviction is on
   the critical path for as long as the overload lasts. It is amortised to ~1,500 cycles
@@ -651,10 +652,10 @@ generation against a timestamp from another.
 
 **Backend.** A per-span state machine keyed by `(point, seq)`. `kNoSeq` is not a special
 case — it is simply the single bucket a point gets when its spans never overlap, so one
-code path serves both. A `begin` on an already-open span counts `abandoned`; any other
-stamp with nothing open counts `orphan`; a backwards timestamp counts `invalid` and
-discards the span rather than emitting one bad stage and a bad total from the same
-events.
+code path serves both. A `begin` on an already-open span counts `abandoned`, as does a
+span still open at shutdown; any other stamp with nothing open counts `orphan`; a
+backwards timestamp counts `invalid` and discards the span rather than emitting one bad
+stage and a bad total from the same events.
 
 **Idle behaviour.** The collector yields for a short burst, then sleeps. There is
 deliberately no park/wake handshake — unlike a logger, nobody is waiting on a perf

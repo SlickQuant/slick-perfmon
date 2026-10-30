@@ -1148,6 +1148,10 @@ private:
         }
 
         final_drain();
+        // Nothing is paired after the final drain, so a span still open can
+        // never close. The age sweep in do_flush() only takes spans older than
+        // stalled_sample_timeout; without this the rest end the session uncounted.
+        pairer_.abandon_all();
         do_flush(std::chrono::steady_clock::now());
         flush_done_.store(flush_request_.load(std::memory_order_acquire), std::memory_order_release);
         write_summary_file();

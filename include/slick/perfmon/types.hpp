@@ -121,7 +121,7 @@ struct stats {
     uint64_t invalid      = 0;  ///< timestamp went backwards within a span
     uint64_t stalled      = 0;  ///< ring holes abandoned by the watchdog
     uint64_t out_of_range = 0;  ///< stage table full
-    uint64_t abandoned    = 0;  ///< span re-opened or evicted before its end
+    uint64_t abandoned    = 0;  ///< span re-opened, evicted, aged out, or open at shutdown
     uint64_t orphan       = 0;  ///< non-begin stamp with no open span
 
     double min    = 0.0;

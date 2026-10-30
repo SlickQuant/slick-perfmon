@@ -48,7 +48,7 @@ constexpr point_id span_point(uint64_t key) noexcept {
 /// rather than being logged and forgotten.
 struct PointAnomalies {
     uint64_t invalid      = 0;  ///< timestamp went backwards inside a span
-    uint64_t abandoned    = 0;  ///< span re-opened, evicted, or aged out
+    uint64_t abandoned    = 0;  ///< span re-opened, evicted, aged out, or open at shutdown
     uint64_t orphan       = 0;  ///< non-begin stamp with no open span
     uint64_t out_of_range = 0;  ///< stage table full, transition dropped
 };
@@ -206,6 +206,25 @@ public:
             }
             return false;
         });
+    }
+
+    /// Count every open span as abandoned and drop it. For the end of a
+    /// session: nothing paired afterwards can close one, and a span younger
+    /// than the sweep's age limit would otherwise end the session uncounted.
+    /// One pass to count, then clear() zeroes the occupancy flags. erase_if
+    /// would shift the cluster back and re-test the slot on every removal.
+    size_t abandon_all() {
+        size_t n = 0;
+        spans_.for_each([&](uint64_t key, OpenSpan&) {
+            ++anomalies(span_point(key)).abandoned;
+            ++n;
+        });
+        spans_.clear();
+        // Every queued candidate is gone. evict_oldest() would skip them on
+        // lookup anyway; cleared so the queue never names a span that isn't open.
+        evict_queue_.clear();
+        evict_next_ = 0;
+        return n;
     }
 
     /// Start a new interval. Called once per flush, after the rows have been

@@ -214,6 +214,37 @@ TEST(Seq, SweepWithNoAgeLimitDoesNothing) {
     EXPECT_EQ(p.open_span_count(), 1u);
 }
 
+TEST(Seq, AbandonAllCountsEveryOpenSpanOnItsOwnPoint) {
+    // The end of a session: nothing afterwards can close a span, however young,
+    // so each one still open is counted on its point and its slot freed.
+    constexpr point_id kOther = kPoint + 1;
+    Pairer p;
+    p.reset(quiet_config());
+
+    p.on_event(ev(kPoint, kBeginStep, 1000, 1));
+    p.on_event(ev(kPoint, kMid, 1100, 1));
+    p.on_event(ev(kPoint, kBeginStep, 1200, 2));
+    p.on_event(ev(kOther, kBeginStep, 1300, 3));
+    p.on_event(ev(kOther, kBeginStep, 1400));
+    p.on_event(ev(kOther, kEndStep, 1500));  // closed, so not abandoned
+
+    EXPECT_EQ(p.abandon_all(), 3u);
+    EXPECT_EQ(p.open_span_count(), 0u);
+    EXPECT_EQ(p.anomalies(kPoint).abandoned, 2u);
+    EXPECT_EQ(p.anomalies(kOther).abandoned, 1u);
+
+    // What was already recorded stays.
+    ASSERT_NE(find_stage(p, kPoint, kBeginStep, kMid), nullptr);
+    EXPECT_EQ(find_stage(p, kPoint, kBeginStep, kMid)->interval.count(), 1u);
+    ASSERT_NE(find_total(p, kOther), nullptr);
+    EXPECT_EQ(find_total(p, kOther)->interval.count(), 1u);
+
+    // A late end finds nothing open.
+    p.on_event(ev(kPoint, kEndStep, 1600, 1));
+    EXPECT_EQ(p.anomalies(kPoint).orphan, 1u);
+    EXPECT_EQ(p.abandon_all(), 0u);
+}
+
 TEST(Seq, IntermediateStepsKeepASpanAlive) {
     // seen_tsc has to advance on every event, not just on begin, or a long
     // multi-step span would be swept out from under itself.

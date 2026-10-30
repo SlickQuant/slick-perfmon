@@ -335,6 +335,59 @@ TEST(CollectorTest, ShutdownDrainsWhatWasAlreadyPublished) {
     EXPECT_TRUE(found) << "the final drain must reach the reports";
 }
 
+TEST(CollectorTest, ShutdownCountsSpansStillOpenAsAbandoned) {
+    // Regression: the final flush only swept spans older than
+    // stalled_sample_timeout, so one left open near the end of a session
+    // disappeared without a count anywhere.
+    Collector c;
+    config    cfg              = quiet_config();
+    cfg.point_count            = static_cast<point_id>(pt::count);
+    cfg.flush_interval         = std::chrono::seconds(60);  // one flush, at shutdown
+    cfg.stalled_sample_timeout = std::chrono::seconds(60);  // the sweep cannot take them
+    ASSERT_TRUE(c.start(cfg));
+
+    begin(pt::work);
+    step(pt::work, kMid);  // and no end
+    begin(pt::other, 7u);  // keyed, no end
+    begin(pt::other);
+    end(pt::other);
+    c.shutdown();
+
+    // pt::work completed no total, so its count rides on the stage it finished.
+    const stats work = c.snapshot(to_point(pt::work), kBeginStep, kMid);
+    EXPECT_EQ(work.count, 1u) << "the finished stage is kept";
+    EXPECT_EQ(work.abandoned, 1u) << "a span open at shutdown must be counted";
+
+    const stats other = c.snapshot_total(to_point(pt::other));
+    EXPECT_EQ(other.count, 1u);
+    EXPECT_EQ(other.abandoned, 1u);
+}
+
+TEST(CollectorTest, APointWhoseOnlySpanWasOpenAtShutdownStillGetsARow) {
+    // No span on the point ever completed, so it has no stage row. The count
+    // must come out on the anomaly-only total row instead.
+    Collector c;
+    config    cfg              = quiet_config();
+    cfg.point_count            = static_cast<point_id>(pt::count);
+    cfg.flush_interval         = std::chrono::seconds(60);  // one flush, at shutdown
+    cfg.stalled_sample_timeout = std::chrono::seconds(60);  // the sweep cannot take it
+    ASSERT_TRUE(c.start(cfg));
+
+    begin(pt::work);  // and nothing else
+    c.shutdown();
+
+    const std::vector<StageReport> rows = c.reports();
+    const auto it = std::find_if(rows.begin(), rows.end(), [](const StageReport& r) {
+        return r.point == to_point(pt::work);
+    });
+    ASSERT_NE(it, rows.end()) << "the point must have a row";
+    EXPECT_EQ(it->stage_name, "total");
+    EXPECT_TRUE(it->anomalies_only);
+    EXPECT_EQ(it->cumulative.count, 0u);
+    EXPECT_EQ(it->cumulative.abandoned, 1u);
+    EXPECT_EQ(it->interval.abandoned, 1u) << "and in the final interval's CSV row";
+}
+
 TEST(CollectorTest, RejectsANonPowerOfTwoCapacity) {
     Collector c;
     config    cfg      = quiet_config();

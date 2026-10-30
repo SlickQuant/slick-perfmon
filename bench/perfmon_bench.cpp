@@ -18,6 +18,7 @@
 #include <slick/perfmon/pairing.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -126,6 +127,119 @@ void throughput(Collector& c, int threads) {
                 static_cast<unsigned long long>(s.dropped),
                 static_cast<unsigned long long>(s.abandoned),
                 static_cast<unsigned long long>(s.orphan), c.peak_open_spans());
+}
+
+/// Busy-wait @p n cycles: stand-in work between and inside stamps.
+void spin_cycles(uint64_t n) {
+    const uint64_t t0 = detail::rdtsc_begin();
+    while (detail::rdtsc_begin() - t0 < n) {
+    }
+}
+
+/// Run @p body(t) on @p threads threads released together.
+template <typename Body>
+void run_threads(int threads, Body&& body) {
+    std::atomic<int>         ready{0};
+    std::vector<std::thread> pool;
+    pool.reserve(static_cast<size_t>(threads));
+    for (int t = 0; t < threads; ++t) {
+        pool.emplace_back([&, t] {
+            ready.fetch_add(1);
+            while (ready.load() < threads) {
+            }
+            body(t);
+        });
+    }
+    for (std::thread& th : pool) {
+        th.join();
+    }
+}
+
+/// Cost of one publish to an instrumented thread while others publish too, at
+/// a realistic rate rather than flat out: value() through the live hot path,
+/// bracketed by two fenced TSC reads whose own cost is subtracted. The
+/// throughput cases above hide this per-call cost, which lands in user code.
+void contended_publish(const config& base, int threads, uint64_t gap) {
+    constexpr int kCalls  = 100000;
+    constexpr int kWarmup = 1000;
+
+    std::vector<uint32_t> empty(kCalls);
+    for (uint32_t& e : empty) {
+        const uint64_t a = detail::rdtsc_begin();
+        const uint64_t b = detail::rdtsc_step();
+        e                = static_cast<uint32_t>(b - a);
+    }
+    std::sort(empty.begin(), empty.end());
+    const double bracket = empty[empty.size() / 2];
+
+    Collector tc;
+    if (!tc.start(base)) {
+        std::fprintf(stderr, "contended collector would not start\n");
+        return;
+    }
+    std::vector<std::vector<uint32_t>> cost(static_cast<size_t>(threads),
+                                            std::vector<uint32_t>(kCalls));
+    run_threads(threads, [&](int t) {
+        std::vector<uint32_t>& c = cost[static_cast<size_t>(t)];
+        for (int i = 0; i < kCalls; ++i) {
+            spin_cycles(gap);
+            const uint64_t a = detail::rdtsc_begin();
+            value(kPoint, static_cast<uint64_t>(i));
+            const uint64_t b = detail::rdtsc_step();
+            c[static_cast<size_t>(i)] = static_cast<uint32_t>(b - a);
+        }
+    });
+    tc.shutdown();
+
+    std::vector<uint32_t> all;
+    for (const auto& c : cost) {
+        all.insert(all.end(), c.begin() + kWarmup, c.end());
+    }
+    std::sort(all.begin(), all.end());
+    double sum = 0;
+    for (uint32_t x : all) {
+        sum += x;
+    }
+    auto at = [&](double q) { return all[static_cast<size_t>(q * (all.size() - 1))] - bracket; };
+    std::printf("%7d %6llu %10.1f %8.0f %8.0f %8.0f\n", threads,
+                static_cast<unsigned long long>(gap), sum / all.size() - bracket, at(0.5),
+                at(0.99), at(0.999));
+}
+
+/// What the stamps add to a measured span when several threads stamp. Each
+/// thread runs begin, kWork cycles of spin, end, then a gap; the collector's
+/// own figures for the total are printed less kWork. A begin publishes after
+/// its timestamp, so whatever that publish costs is inside the span.
+void span_inflation(const config& base, int threads) {
+    constexpr int      kSpans = 50000;
+    constexpr uint64_t kWork  = 1000;
+    constexpr uint64_t kGap   = 2000;
+
+    Collector tc;
+    config    cfg   = base;
+    cfg.output_unit = unit::cycles;
+    if (!tc.start(cfg)) {
+        std::fprintf(stderr, "inflation collector would not start\n");
+        return;
+    }
+    run_threads(threads, [](int t) {
+        const span_seq seq = static_cast<span_seq>(t + 1);
+        for (int i = 0; i < kSpans; ++i) {
+            begin(kPoint, seq);
+            spin_cycles(kWork);
+            end(kPoint, seq);
+            spin_cycles(kGap);
+        }
+    });
+    tc.flush();
+    const stats s = tc.snapshot_total(kPoint);
+    tc.shutdown();
+
+    // percentiles are configured as 50, 90, 99, 99.9
+    std::printf("%7d %10.1f %8.0f %8.0f %8.0f %10llu %8llu\n", threads, s.mean - kWork,
+                s.percentiles[0] - kWork, s.percentiles[2] - kWork, s.percentiles[3] - kWork,
+                static_cast<unsigned long long>(s.dropped),
+                static_cast<unsigned long long>(s.orphan));
 }
 
 
@@ -364,6 +478,10 @@ int main(int argc, char** argv) {
     cfg.path           = "";
     cfg.summary_path   = "";
     cfg.queue_capacity = 1u << 20;  // large, so drops do not distort the timing
+    // Thread rings likewise: a flat-out thread fills the default 64K in ~3 ms,
+    // and the collector calibrates for 10 ms before its first drain.
+    cfg.thread_ring_capacity = 1u << 20;
+    cfg.max_thread_rings     = 16;
     cfg.max_open_spans = 8192;
     cfg.flush_interval = std::chrono::seconds(3600);
 
@@ -458,6 +576,25 @@ int main(int argc, char** argv) {
         }
         throughput(tc, threads);
         tc.shutdown();
+    }
+
+    std::printf("\ncontended publish: one value() call while other threads publish,\n"
+                "cycles, two fenced TSC reads subtracted\n");
+    std::printf("%7s %6s %10s %8s %8s %8s\n", "threads", "gap", "mean", "p50", "p99", "p99.9");
+    std::printf("%s\n", std::string(52, '-').c_str());
+    for (uint64_t gap : {1000u, 5000u}) {
+        for (int threads : {1, 2, 4, 8}) {
+            contended_publish(cfg, threads, gap);
+        }
+    }
+
+    std::printf("\nspan inflation: begin, 1000-cycle spin, end; collector's total less\n"
+                "the spin, cycles\n");
+    std::printf("%7s %10s %8s %8s %8s %10s %8s\n", "threads", "mean", "p50", "p99", "p99.9",
+                "dropped", "orphan");
+    std::printf("%s\n", std::string(66, '-').c_str());
+    for (int threads : {1, 2, 4, 8}) {
+        span_inflation(cfg, threads);
     }
 
     std::printf("\ncollector backend - off the hot path, but on the critical path for\n"

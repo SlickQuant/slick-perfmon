@@ -72,7 +72,16 @@ struct config {
     std::chrono::milliseconds calibration_time{10};
     std::chrono::milliseconds stalled_sample_timeout{5000};
 
-    uint32_t queue_capacity = 1u << 16;   ///< slots; must be a power of two
+    uint32_t queue_capacity = 1u << 16;   ///< shared ring slots; must be a power of two
+
+    /// Per-thread rings. Each instrumenting thread claims one on its first
+    /// stamp, so stamps never contend; threads past this many use the shared
+    /// ring. 0 sends every thread through the shared ring.
+    uint32_t max_thread_rings = 64;
+    /// Slots per thread ring, a power of two. A ring keeps its newest
+    /// capacity - 1 samples and must hold ~2 ms plus one collector pass of its
+    /// thread's output. 16 bytes per slot, touched only as the ring is used.
+    uint32_t thread_ring_capacity = 1u << 16;
 
     std::vector<double> percentiles = {50.0, 90.0, 99.0, 99.9};
     unit output_unit = unit::nanoseconds;
@@ -80,13 +89,13 @@ struct config {
     /**
      * Subtract the measured per-stamp cost from every transition.
      *
-     * Off by default, and deliberately so. The calibration runs back-to-back
-     * stamps against a private, uncontended ring, which is measurably cheaper
-     * than the real thing: on the live ring the producer contends with the
-     * collector for the reservation counter and the slot's cache line, and in
-     * practice costs around twice the calibrated figure. Subtracting a number
-     * that is systematically low leaves a residue that is invisible, whereas
-     * reporting raw cycles leaves the overhead visible and lets
+     * Off by default, and deliberately so. The calibration is a minimum over
+     * back-to-back stamps against a private ring whose lines never leave the
+     * core, which is cheaper than the real thing: on a live ring the
+     * collector's reads cost the producer the odd cache miss, so a typical
+     * stamp runs above the calibrated figure. Subtracting a number that is
+     * systematically low leaves a residue that is invisible, whereas reporting
+     * raw cycles leaves the overhead visible and lets
      * Collector::overhead_cycles() say how big the floor is.
      *
      * Turn it on when the regions being measured are short enough that the

@@ -13,12 +13,21 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <memory>
 #include <string>
 #include <thread>
 #include <vector>
+
+#if !defined(_WIN32)
+#include <signal.h>
+#include <spawn.h>
+#include <sys/wait.h>
+#include <unistd.h>
+extern char** environ;
+#endif
 
 using namespace slick::perfmon;
 using namespace slick::perfmon::test;
@@ -74,6 +83,105 @@ config collector_config(const std::string& shm) {
     cfg.name_of     = &names;
     return cfg;
 }
+
+uint32_t this_pid() {
+#if defined(_WIN32)
+    return static_cast<uint32_t>(::GetCurrentProcessId());
+#else
+    return static_cast<uint32_t>(::getpid());
+#endif
+}
+
+/// Rings of the shared table in @p state, held by a process other than this one.
+size_t foreign_rings(const Collector& c, uint64_t state) {
+    const detail::ring_table& t = c.session()->rings;
+    size_t                    n = 0;
+    for (uint32_t i = 0; i < t.count(); ++i) {
+        const uint64_t owner = t.slot(i).owner.load(std::memory_order_acquire);
+        if (detail::ring_state(owner) == state && detail::ring_pid(owner) != this_pid()) {
+            ++n;
+        }
+    }
+    return n;
+}
+
+size_t free_rings(const Collector& c) {
+    const detail::ring_table& t = c.session()->rings;
+    size_t                    n = 0;
+    for (uint32_t i = 0; i < t.count(); ++i) {
+        n += t.slot(i).owner.load(std::memory_order_acquire) == detail::kRingFree ? 1u : 0u;
+    }
+    return n;
+}
+
+template <typename Pred>
+bool eventually(Pred&& done) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (!done()) {
+        if (std::chrono::steady_clock::now() > deadline) {
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    return true;
+}
+
+/// The helper producer, started without waiting for it, so a test can kill it.
+class killable_producer {
+public:
+    explicit killable_producer(std::vector<std::string> args) {
+        args.insert(args.begin(), PRODUCER_EXE_PATH);
+#if defined(_WIN32)
+        std::string line;
+        for (const std::string& a : args) {
+            line += "\"" + a + "\" ";
+        }
+        STARTUPINFOA si{};
+        si.cb    = sizeof(si);
+        started_ = ::CreateProcessA(nullptr, line.data(), nullptr, nullptr, FALSE, 0, nullptr,
+                                    nullptr, &si, &pi_) != 0;
+#else
+        std::vector<char*> argv;
+        for (std::string& a : args) {
+            argv.push_back(a.data());
+        }
+        argv.push_back(nullptr);
+        started_ = ::posix_spawn(&pid_, argv[0], nullptr, nullptr, argv.data(), environ) == 0;
+#endif
+    }
+
+    ~killable_producer() { kill(); }
+
+    killable_producer(const killable_producer&)            = delete;
+    killable_producer& operator=(const killable_producer&) = delete;
+
+    bool started() const noexcept { return started_; }
+
+    void kill() {
+        if (!started_) {
+            return;
+        }
+        started_ = false;
+#if defined(_WIN32)
+        ::TerminateProcess(pi_.hProcess, 9);
+        ::WaitForSingleObject(pi_.hProcess, INFINITE);
+        ::CloseHandle(pi_.hThread);
+        ::CloseHandle(pi_.hProcess);
+#else
+        ::kill(pid_, SIGKILL);
+        int status = 0;
+        ::waitpid(pid_, &status, 0);
+#endif
+    }
+
+private:
+    bool started_ = false;
+#if defined(_WIN32)
+    PROCESS_INFORMATION pi_{};
+#else
+    pid_t pid_ = -1;
+#endif
+};
 
 }  // namespace
 
@@ -470,7 +578,9 @@ bool ring_exists(const std::string& shm) {
 /// Whether a session's control block segment exists.
 bool control_block_exists(const std::string& shm) {
     ControlBlockOwner probe;
-    return probe.attach_shared(shm + SLICK_PERFMON_META_SUFFIX, config{}.max_names);
+    const config      defaults;
+    return probe.attach_shared(shm + SLICK_PERFMON_META_SUFFIX, defaults.max_names,
+                               defaults.max_thread_rings, defaults.thread_ring_capacity);
 }
 
 constexpr std::string_view strategy_only(point_id p, uint8_t step) noexcept {
@@ -572,6 +682,206 @@ TEST(Shm, ACollectorRestartKeepsARunningProducersSegmentsAndNames) {
     EXPECT_TRUE(found);
 
     second.shutdown();
+    producer.shutdown();
+}
+
+TEST(Shm, AMultiThreadedProducerStampsThroughItsOwnRings) {
+    const scoped_shm_name shm("mtprod");
+    Collector             c;
+    ASSERT_TRUE(c.start(collector_config(shm)));
+
+    std::thread a([&] { run_producer(shm, kPointA, 2000, "--threads 4"); });
+    std::thread b([&] { run_producer(shm, kPointB, 2000, "--threads 4"); });
+    a.join();
+    b.join();
+
+    for (point_id p : {kPointA, kPointB}) {
+        const stats s = c.snapshot_total(p);
+        EXPECT_EQ(s.count, 8000u);
+        EXPECT_EQ(s.dropped, 0u);
+        EXPECT_EQ(s.orphan, 0u);
+        EXPECT_EQ(s.abandoned, 0u);
+    }
+    EXPECT_EQ(c.ring()->initial_reading_index(), 0u) << "every stamp had a thread ring";
+    // Both producers shut down cleanly, handing their rings back.
+    EXPECT_TRUE(eventually([&] { return free_rings(c) == c.session()->rings.count(); }));
+    c.shutdown();
+}
+
+TEST(Shm, ASpanOpenedInOneProcessClosesInAnother) {
+    // The begins and the ends sit in different processes' rings; the merge by
+    // timestamp has to put each begin first.
+    const scoped_shm_name shm("xproc");
+    Collector             c;
+    ASSERT_TRUE(c.start(collector_config(shm)));
+
+    ASSERT_EQ(run_producer(shm, kPointA, 1000, "--leave-open"), 0);
+    ASSERT_EQ(run_producer(shm, kPointA, 1000, "--end-only"), 0);
+
+    const stats s = c.snapshot_total(kPointA);
+    EXPECT_EQ(s.count, 1000u);
+    EXPECT_EQ(s.orphan, 0u);
+    EXPECT_EQ(s.abandoned, 0u);
+    c.shutdown();
+}
+
+TEST(Shm, ADeadProducersRingsAreReclaimed) {
+    // A producer killed holding rings never hands them back itself. The
+    // collector notices the process is gone, drains what it published and
+    // frees the rings.
+    const scoped_shm_name shm("dead");
+    Collector             c;
+    ASSERT_TRUE(c.start(collector_config(shm)));
+
+    killable_producer p({shm.str(), "0", "100", "--threads", "3", "--hang"});
+    ASSERT_TRUE(p.started());
+    ASSERT_TRUE(eventually([&] { return foreign_rings(c, detail::kRingActive) == 3u; }));
+    ASSERT_TRUE(eventually([&] { return c.snapshot_total(kPointA).count == 300u; }));
+    p.kill();
+
+    EXPECT_TRUE(eventually([&] { return free_rings(c) == c.session()->rings.count(); }));
+    EXPECT_EQ(c.snapshot_total(kPointA).count, 300u);
+    c.shutdown();
+}
+
+TEST(Shm, AttachingWithMismatchedThreadRingsThrows) {
+    const scoped_shm_name shm("badrings");
+
+    Collector collector;
+    config    ccfg        = collector_config(shm);
+    ccfg.max_thread_rings = 8;
+    ASSERT_TRUE(collector.start(ccfg));
+
+    // A peer with another geometry would claim and write rings at the wrong
+    // offsets.
+    Collector peer;
+    config    bad = quiet_config();
+    bad.run_mode  = mode::shared_producer;
+    bad.shm_name  = shm;
+    EXPECT_THROW((void)peer.start(bad), std::runtime_error);  // 64 rings
+    bad.max_thread_rings     = 8;
+    bad.thread_ring_capacity = 1u << 10;
+    EXPECT_THROW((void)peer.start(bad), std::runtime_error);  // smaller rings
+
+    collector.shutdown();
+}
+
+TEST(Shm, TwoSessionsInOneProcessKeepTheirOwnRings) {
+    // Regression: a session's tag was 24 bits of its id, and two modules each
+    // count ids from their own counter, so two sessions on one table could
+    // share a tag - and one's shutdown() then retired the other's rings. The
+    // table hands tags out now.
+    const scoped_shm_name shm("twosess");
+    Collector             c;
+    ASSERT_TRUE(c.start(collector_config(shm)));
+
+    config pcfg   = quiet_config();
+    pcfg.run_mode = mode::shared_producer;
+    pcfg.shm_name = shm;
+    Collector first;
+    ASSERT_TRUE(first.start(pcfg));  // this thread takes a ring for `first`
+    Collector second;
+    ASSERT_TRUE(second.start(pcfg));  // and rebinds, taking another for `second`
+
+    const uint64_t a = first.session()->owner;
+    const uint64_t b = second.session()->owner;
+    EXPECT_EQ(((b >> 8) & 0xFFFFFF), ((a >> 8) & 0xFFFFFF) + 1) << "tags come from the table";
+
+    auto held_by = [&](uint64_t owner) {
+        const detail::ring_table& t = c.session()->rings;
+        size_t                    n = 0;
+        for (uint32_t i = 0; i < t.count(); ++i) {
+            n += t.slot(i).owner.load(std::memory_order_acquire) == owner ? 1u : 0u;
+        }
+        return n;
+    };
+    ASSERT_EQ(held_by(a), 1u);
+    ASSERT_EQ(held_by(b), 1u);
+    second.shutdown();
+    EXPECT_EQ(held_by(a), 1u) << "the other session's shutdown took this ring";
+    EXPECT_EQ(held_by(b), 0u);
+
+    first.shutdown();
+    c.shutdown();
+}
+
+TEST(Shm, ACollectorRestartKeepsDrainingAProducersThreadRing) {
+    // The thread-ring counterpart of the test above: the ring this thread
+    // claimed through the producer's mapping must be the one the replacement
+    // collector drains.
+    const scoped_shm_name shm("survive2");
+
+    auto first = std::make_unique<Collector>();
+    ASSERT_TRUE(first->start(collector_config(shm)));
+
+    Collector producer;
+    config    pcfg = quiet_config();
+    pcfg.run_mode  = mode::shared_producer;
+    pcfg.shm_name  = shm;
+    ASSERT_TRUE(producer.start(pcfg));  // claims this thread's ring
+    const detail::session& kept = *producer.session();
+
+    first->shutdown();
+    first.reset();
+
+    Collector second;
+    ASSERT_TRUE(second.start(collector_config(shm)));
+
+    // Through the producer's session explicitly; this thread's hot path now
+    // points at the replacement. See the test above for why.
+    constexpr int kSpans = 300;
+    for (int i = 0; i < kSpans; ++i) {
+        const span_seq seq = static_cast<span_seq>(i + 1);
+        detail::publish(detail::bound_writer(kept), kept, detail::rdtsc_begin(), kPointB,
+                        make_event(kBeginStep, seq));
+        detail::publish(detail::bound_writer(kept), kept, detail::rdtsc_step(), kPointB,
+                        make_event(kEndStep, seq));
+    }
+    EXPECT_EQ(second.snapshot_total(kPointB).count, kSpans);
+    EXPECT_EQ(second.ring()->initial_reading_index(), 0u) << "these went through a thread ring";
+
+    second.shutdown();
+    producer.shutdown();
+}
+
+TEST(Shm, ACollectorReturnsWhileAProducerKeepsRecordingValues) {
+    // Regression: a flush, and the final drain in shutdown(), read each ring
+    // until it came up empty. A producer in another process is not detached
+    // by the collector's shutdown, and one recording values outruns the
+    // collector, so neither returned. A thread here stands in for that process.
+    const scoped_shm_name shm("liveprod");
+    Collector             c;
+    ASSERT_TRUE(c.start(collector_config(shm)));
+
+    Collector producer;
+    config    pcfg = quiet_config();
+    pcfg.run_mode  = mode::shared_producer;
+    pcfg.shm_name  = shm;
+    ASSERT_TRUE(producer.start(pcfg));
+    const detail::session& kept = *producer.session();
+
+    std::atomic<bool> stop{false};
+    std::atomic<bool> running{false};
+    std::thread       t([&] {
+        running.store(true);
+        while (!stop.load(std::memory_order_relaxed)) {
+            detail::publish(detail::bound_writer(kept), kept, 1, kPointA, make_event(kValueStep));
+        }
+    });
+    while (!running.load()) {
+    }
+    // Bounded as well as finite, so a slow drain fails here too.
+    constexpr auto kBound = std::chrono::seconds(2);
+    for (int i = 0; i < 3; ++i) {
+        const auto t0 = std::chrono::steady_clock::now();
+        (void)c.snapshot_value(kPointA);
+        EXPECT_LT(std::chrono::steady_clock::now() - t0, kBound) << "snapshot " << i;
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    c.shutdown();
+    EXPECT_LT(std::chrono::steady_clock::now() - t0, kBound) << "shutdown";
+    stop.store(true);
+    t.join();
     producer.shutdown();
 }
 

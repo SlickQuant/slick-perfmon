@@ -1,5 +1,44 @@
 # Changelog
 
+## v0.4.0 - Unreleased
+
+Breaking changes are in bold under Changed.
+
+### Added
+
+- Per-thread rings. Each instrumenting thread claims a single-producer ring on its first
+  stamp, so stamps no longer contend: a publish is three relaxed stores and a release
+  store, with no read-modify-write. The collector merges the rings by timestamp, so spans
+  still cross threads, DLLs and processes. Threads past the cap use the shared ring.
+- `config::max_thread_rings` (64; 0 sends every thread through the shared ring) and
+  `config::thread_ring_capacity` (65536 slots). Together they are capped at 2 GiB.
+- `prepare_thread()`, which claims the calling thread's ring and faults its pages in.
+  `start()` does it for its own thread.
+- `Collector::session()`, the handle `attach()` takes.
+- The collector frees rings held by a producer process that died.
+- `--thread-rings` and `--thread-ring-capacity` on `slick_perfmon_collector`.
+- Benchmark cases for the cost of a publish and of a span at 1 to 8 threads.
+
+### Changed
+
+- **`attach()` takes `Collector::session()`** instead of a `sample_queue*`, and a module
+  that attached must attach again after the host restarts. Until it does, its stamps go
+  to the ended session and are not recorded.
+- **`Collector::ring()` is only the shared ring** that threads past the cap use. With
+  rings on, stamps written into it by hand are merged with the rings by timestamp, not
+  paired in the order written.
+- **The shared-memory layout version is 5.** The thread rings live in the `.meta` segment
+  after the names. Rebuild collectors and producers together; a producer must use the
+  collector's thread ring settings or `start()` throws.
+- Stamps are paired once they are 2 ms old, so periodic rows trail by that much.
+  `flush()`, `snapshot()` and `shutdown()` wait at least ~20 µs instead and pair
+  everything stamped before the call. A thread that keeps stamping cannot hold them up.
+- The collector waits at least 50 µs between passes that found work.
+- A stamp costs ~172 cycles (was ~205) and a value sample ~16 (was ~29). At 8 threads a
+  publish costs ~68 cycles where it cost ~429.
+- With rings on, stamps from threads past the cap are ordered by timestamp, so a
+  backwards TSC on one of them reads as `orphan` rather than `invalid`.
+
 ## v0.3.0 - 10-13-2026
 
 Several changes here are breaking: the entries in bold under Changed.

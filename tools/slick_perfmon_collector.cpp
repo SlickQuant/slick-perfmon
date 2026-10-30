@@ -35,7 +35,10 @@ void usage(const char* argv0) {
         "  --csv <path>        CSV time series           (default perfmon.csv)\n"
         "  --summary <path>    summary table at exit     (default perfmon_summary.txt)\n"
         "  --interval <ms>     flush interval            (default 1000)\n"
-        "  --capacity <n>      ring slots, power of two  (default 65536)\n"
+        "  --capacity <n>      shared ring slots, power of two (default 65536)\n"
+        "  --thread-rings <n>  per-thread rings; 0 = all on the shared ring (default 64)\n"
+        "  --thread-ring-capacity <n>\n"
+        "                      slots per thread ring, power of two (default 65536)\n"
         "  --max-open <n>      concurrent open spans     (default 4096)\n"
         "  --max-stages <n>    distinct stage rows       (default 1024)\n"
         "  --unit <u>          ns | us | cycles          (default ns)\n"
@@ -89,6 +92,10 @@ int main(int argc, char** argv) {
             cfg.flush_interval = std::chrono::milliseconds(std::atoi(argv[++i]));
         } else if (arg == "--capacity" && more) {
             cfg.queue_capacity = static_cast<uint32_t>(std::strtoul(argv[++i], nullptr, 10));
+        } else if (arg == "--thread-rings" && more) {
+            cfg.max_thread_rings = static_cast<uint32_t>(std::strtoul(argv[++i], nullptr, 10));
+        } else if (arg == "--thread-ring-capacity" && more) {
+            cfg.thread_ring_capacity = static_cast<uint32_t>(std::strtoul(argv[++i], nullptr, 10));
         } else if (arg == "--max-open" && more) {
             cfg.max_open_spans = static_cast<uint32_t>(std::strtoul(argv[++i], nullptr, 10));
         } else if (arg == "--max-stages" && more) {

@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <slick/perfmon/detail/ring_table.hpp>
 #include <slick/perfmon/types.hpp>
 
 // windows.h - which slick-shm pulls in - defines min and max as macros, and
@@ -66,7 +67,9 @@ struct control_block {
     /// it used to be an ordinary intermediate step. The bytes are unchanged,
     /// but a collector and a producer either side of that would read one
     /// event two ways - a value as an orphan step, or a step as a value.
-    static constexpr uint32_t kLayoutVersion = 4;
+    /// 5: the per-thread ring table follows the names, and the header carries
+    /// its geometry.
+    static constexpr uint32_t kLayoutVersion = 5;
 
     static constexpr uint32_t kUninitialised = 0;
     static constexpr uint32_t kInitialising  = 1;
@@ -100,6 +103,8 @@ struct control_block {
     uint32_t layout_version;
     uint32_t max_names;
     uint32_t name_capacity;
+    uint32_t ring_count;     ///< per-thread rings after the names; 0 = none
+    uint32_t ring_capacity;  ///< slots per ring
 
     std::atomic<uint64_t> tsc_hz_milli;   ///< collector-published rate, in mHz
     std::atomic<uint32_t> invariant_tsc;  ///< 1 when the TSC is trustworthy
@@ -117,14 +122,26 @@ struct control_block {
      */
     std::atomic<uint64_t> name_generation;
 
-    // name_entry[max_names] follows immediately.
+    // name_entry[max_names] follows immediately, then, 64-byte aligned, the
+    // ring table when ring_count > 0.
 
     name_entry* names() noexcept {
         return reinterpret_cast<name_entry*>(reinterpret_cast<char*>(this) + sizeof(control_block));
     }
 
-    static size_t bytes_for(uint32_t max_names) noexcept {
-        return sizeof(control_block) + static_cast<size_t>(max_names) * sizeof(name_entry);
+    void* rings() noexcept {
+        return ring_count == 0 ? nullptr : reinterpret_cast<char*>(this) + rings_offset(max_names);
+    }
+
+    static size_t rings_offset(uint32_t max_names) noexcept {
+        const size_t names_end =
+            sizeof(control_block) + static_cast<size_t>(max_names) * sizeof(name_entry);
+        return (names_end + 63) & ~size_t{63};
+    }
+
+    static size_t bytes_for(uint32_t max_names, uint32_t rings = 0, uint32_t capacity = 0) noexcept {
+        return rings == 0 ? rings_offset(max_names)
+                          : rings_offset(max_names) + detail::ring_table::bytes_for(rings, capacity);
     }
 };
 
@@ -171,8 +188,9 @@ public:
     /// names included - which is the point, since those are the names of
     /// producers that are still running - and a different max_names is the
     /// same peer mismatch it would be against a live one.
-    bool create_shared(const std::string& shm_name, uint32_t max_names) {
-        const size_t bytes = control_block::bytes_for(max_names);
+    bool create_shared(const std::string& shm_name, uint32_t max_names, uint32_t rings = 0,
+                       uint32_t ring_capacity = 0) {
+        const size_t bytes = control_block::bytes_for(max_names, rings, ring_capacity);
         shm_ = std::make_unique<slick::shm::shared_memory>(
             shm_name.c_str(), bytes, slick::shm::open_or_create,
             slick::shm::access_mode::read_write, std::nothrow);
@@ -183,13 +201,13 @@ public:
         block_ = static_cast<control_block*>(shm_->data());
 
         if (shm_->is_creator()) {
-            initialise(max_names);
+            initialise(max_names, rings, ring_capacity);
         } else {
             if (!await_ready()) {
                 reset();
                 return false;
             }
-            validate(max_names);
+            validate(max_names, rings, ring_capacity);
         }
         return true;
     }
@@ -197,7 +215,8 @@ public:
     /// Attach to a segment someone else created. Returns false when it is not
     /// there, which is the normal "collector is not running" case and must stay
     /// cheap and silent rather than throwing.
-    bool attach_shared(const std::string& shm_name, uint32_t max_names) {
+    bool attach_shared(const std::string& shm_name, uint32_t max_names, uint32_t rings = 0,
+                       uint32_t ring_capacity = 0) {
         shm_ = std::make_unique<slick::shm::shared_memory>(
             shm_name.c_str(), slick::shm::open_existing,
             slick::shm::access_mode::read_write, std::nothrow);
@@ -210,17 +229,30 @@ public:
             reset();
             return false;
         }
-        validate(max_names);
+        validate(max_names, rings, ring_capacity);
         return true;
     }
 
+    /// Local mode keeps its rings outside the block, so this one has none.
     void create_local(uint32_t max_names) {
         heap_.assign(control_block::bytes_for(max_names), std::byte{});
         block_ = reinterpret_cast<control_block*>(heap_.data());
-        initialise(max_names);
+        initialise(max_names, 0, 0);
     }
 
     control_block* block() const noexcept { return block_; }
+
+    /// The ring table laid out after the names, or null when there is none.
+    void* rings() const noexcept { return block_ == nullptr ? nullptr : block_->rings(); }
+
+    /// Give up the mapping without unmapping it, for the caller to keep alive
+    /// while a stamp may still be writing into the rings inside it. Leaves this
+    /// owner unstarted, as reset() does.
+    std::unique_ptr<slick::shm::shared_memory> release_mapping() noexcept {
+        std::unique_ptr<slick::shm::shared_memory> m = std::move(shm_);
+        reset();
+        return m;
+    }
     explicit operator bool() const noexcept { return block_ != nullptr; }
 
     /// Release the segment (or the heap block) and go back to the unstarted
@@ -363,12 +395,14 @@ public:
     }
 
 private:
-    void initialise(uint32_t max_names) {
+    void initialise(uint32_t max_names, uint32_t rings, uint32_t ring_capacity) {
         block_->init_state.store(control_block::kInitialising, std::memory_order_relaxed);
         block_->magic          = control_block::kMagic;
         block_->layout_version = control_block::kLayoutVersion;
         block_->max_names      = max_names;
         block_->name_capacity  = SLICK_PERFMON_NAME_CAPACITY;
+        block_->ring_count     = rings;
+        block_->ring_capacity  = ring_capacity;
         block_->tsc_hz_milli.store(0, std::memory_order_relaxed);
         block_->invariant_tsc.store(1, std::memory_order_relaxed);
         block_->name_generation.store(0, std::memory_order_relaxed);
@@ -377,6 +411,10 @@ private:
         for (uint32_t i = 0; i < max_names; ++i) {
             tbl[i].key_plus_one.store(0, std::memory_order_relaxed);
             tbl[i].name[0] = '\0';
+        }
+        if (rings > 0) {
+            detail::ring_table t;
+            t.create(block_->rings(), rings, ring_capacity);
         }
         block_->init_state.store(control_block::kReady, std::memory_order_release);
     }
@@ -395,7 +433,7 @@ private:
         return false;
     }
 
-    void validate(uint32_t max_names) const {
+    void validate(uint32_t max_names, uint32_t rings, uint32_t ring_capacity) const {
         if (block_->magic != control_block::kMagic) {
             throw std::runtime_error("slick-perfmon: control block magic mismatch");
         }
@@ -408,6 +446,11 @@ private:
         }
         if (block_->max_names != max_names) {
             throw std::runtime_error("slick-perfmon: peer configured a different max_names");
+        }
+        if (block_->ring_count != rings || (rings > 0 && block_->ring_capacity != ring_capacity)) {
+            throw std::runtime_error(
+                "slick-perfmon: peer configured a different max_thread_rings or "
+                "thread_ring_capacity");
         }
     }
 

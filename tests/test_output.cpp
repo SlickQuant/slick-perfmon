@@ -91,14 +91,13 @@ std::vector<std::string> words(const std::string& line) {
     return out;
 }
 
-/// Publish one sample with a chosen timestamp straight into the collector's
-/// ring - what a real stamp does, minus reading the TSC, which a test needs to
-/// control to know what the statistics must come out as.
+/// Publish one sample with a chosen timestamp through this thread's ring.
+/// That is what a real stamp does minus the TSC read: the test sets the
+/// timestamp so it knows what the statistics must come out as.
 void publish_raw(Collector& c, uint64_t tsc, uint8_t step) {
-    sample_queue&  q    = *c.ring();
-    const uint64_t slot = q.reserve();
-    q[slot]->store(tsc, static_cast<point_id>(pt::pipeline), make_event(step));
-    q.publish(slot);
+    const detail::session& s = *c.session();
+    detail::publish(detail::bound_writer(s), s, tsc, static_cast<point_id>(pt::pipeline),
+                    make_event(step));
 }
 
 /// Each test gets its own files, and removes them first so a previous run

@@ -753,7 +753,9 @@ TEST(CollectorTest, ShutdownIsNotHeldByAProducerThatKeepsPublishing) {
     sample_queue* q = c.ring();
     ASSERT_NE(q, nullptr);
 
-    constexpr auto    kProducerRuns = std::chrono::seconds(5);
+    // A shutdown under TSan with other tests running takes ~1 s; the bound has
+    // room for that and stays far below the producer.
+    constexpr auto    kProducerRuns = std::chrono::seconds(10);
     std::atomic<bool> stop{false};
     std::atomic<bool> publishing{false};
     std::thread       producer([&] {
@@ -784,7 +786,7 @@ TEST(CollectorTest, ShutdownIsNotHeldByAProducerThatKeepsPublishing) {
     stop.store(true, std::memory_order_relaxed);
     producer.join();  // before ~Collector frees the ring it is writing to
 
-    EXPECT_LT(took, std::chrono::seconds(1))
+    EXPECT_LT(took, std::chrono::seconds(2))
         << "shutdown waited "
         << std::chrono::duration_cast<std::chrono::milliseconds>(took).count()
         << " ms for a producer that never stopped";

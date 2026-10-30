@@ -70,3 +70,7 @@ Testing/
 
 .claude/
 .codex/
+
+# Local scratch notes
+/plan
+/patch

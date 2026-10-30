@@ -9,7 +9,7 @@
 
 A header-only C++20 latency measurement library for code that cannot afford to be
 measured. The instrumented thread reads the TSC and publishes 16 bytes to a lock-free
-MPMC ring. Everything else — pairing, min/max/mean, Welford variance, histogram
+ring of its own. Everything else — pairing, min/max/mean, Welford variance, histogram
 percentiles, cycles-to-nanoseconds, formatting, file I/O — happens somewhere else, on a
 collector thread or, in production, in a separate process. The same 16 bytes carry plain
 values too — a queue depth, a batch size — with no timestamp read at all.
@@ -17,16 +17,17 @@ values too — a queue depth, a batch size — with no timestamp read at all.
 ## How it works
 
 ```
-  instrumented threads                    lock-free MPMC ring            collector
-  ───────────────────────                ────────────────────          ──────────────
+  instrumented threads                    one SPSC ring per thread        collector
+  ───────────────────────                ────────────────────────      ──────────────
   begin(tick, seq) ──┐                    ┌──────────────────┐
-  step(tick, decode) ┼──► RDTSC(P) ──────►│ 16-byte events   │──────►  pair by
-  step(tick, match)  ┤    + 16B publish   │ ts | point | evt │         (point, seq)
-  end(tick, seq)  ───┘                    └──────────────────┘              │
+  step(tick, decode) ┼──► RDTSC(P) ──────►│ 16-byte events   │──┐      merge rings
+  step(tick, match)  ┤    + 16B publish   │ ts | point | evt │  ├───►  by TSC, pair by
+  end(tick, seq)  ───┘                    └──────────────────┘  │      (point, seq)
+  other threads ────────────────────────► [ their own rings ] ──┘           │
                                                                             ▼
-         one TSC read, one store,                              min/max/mean, Welford,
-         one publish. No pairing,                              histogram percentiles
-         no arithmetic, no locks.                                          │
+         one TSC read, four stores.                            min/max/mean, Welford,
+         No read-modify-write, no                              histogram percentiles
+         pairing, no locks.                                                │
                                                           ┌────────────────┴───────────┐
                                                           ▼                            ▼
                                                     perfmon.csv              perfmon_summary.txt
@@ -42,9 +43,10 @@ its distribution in the same files. See [Record a value](#record-a-value).
 
 ## Features
 
-- **A fixed ~200 cycles per stamp, and nothing else, ever.** One serialized TSC read,
-  one `fetch_add`, three stores. No delta, no lookup, no thread-local state, no locks —
-  and, crucially, no aggregation, however many points you add or however detailed the
+- **A fixed ~170 cycles per stamp, and nothing else, ever.** One serialized TSC read and
+  four stores into the thread's own ring, with no read-modify-write, no delta, no lookup
+  and no locks. Threads never contend, so the cost stays flat at 8 threads. Nothing is
+  aggregated on the measured thread, however many points you add or however detailed the
   statistics get. See [Measured overhead](#measured-overhead).
 - **Multi-step spans for free.** `begin → decode → match → send → end` yields per-stage
   latencies *and* the total, from four stamps rather than eight.
@@ -54,7 +56,7 @@ its distribution in the same files. See [Record a value](#record-a-value).
   (an order id, a message sequence, a thread index).
 - **Values as well as latencies.** `value(point, n)` records a number that is a
   measurement in itself — a queue depth, a batch size, a byte count — with no begin, no
-  end and no timestamp, for ~30 cycles. It gets the same statistics, in the same CSV.
+  end and no timestamp, for ~16 cycles. It gets the same statistics, in the same CSV.
 - **Out-of-process collection.** The measured process does zero analysis and no file
   I/O, and its numbers survive its own crash. The collector can be restarted under
   running producers without restarting them.
@@ -197,7 +199,9 @@ Everything else has a default that gives a working in-process session:
 | `csv_flush_interval` | 0 | 0 pushes the stream every interval; higher defers it |
 | `calibration_time` | 10 ms | TSC calibration window inside `start()` |
 | `stalled_sample_timeout` | 5 s | age at which an open span is abandoned and a ring hole stepped over; at shutdown holes get at most 100 ms in total |
-| `queue_capacity` | 65536 | ring slots; must be a power of two |
+| `queue_capacity` | 65536 | shared ring slots, for threads without a ring of their own; a power of two |
+| `max_thread_rings` | 64 | per-thread rings; 0 sends every thread through the shared ring |
+| `thread_ring_capacity` | 65536 | slots per thread ring; a power of two, 16 bytes each |
 | `max_open_spans` | 4096 | concurrently open `(point, seq)` spans; a full table evicts |
 | `max_stages` | 1024 | distinct stage accumulators, and the bound on distinct points |
 | `max_names` | 512 | name slots in the shared control block |
@@ -273,6 +277,30 @@ open span per point, and costs nothing extra.
 
 If you get it wrong, you get `abandoned` counts rather than a plausible wrong number.
 
+### Per-thread rings
+
+Each instrumenting thread claims a ring of its own on its first stamp, so stamps never
+contend: there is no shared counter and no cache line moving between cores. The
+collector merges the rings by timestamp, so a span can still begin on one thread and end
+on another.
+
+- A session has `max_thread_rings` rings (64). Threads past that use the shared ring
+  (`queue_capacity`) for the rest of the session. Nothing is lost; they just pay for the
+  shared counter. `max_thread_rings = 0` sends every thread there.
+- A thread that exits hands its ring back, and the next new thread reuses it.
+- A ring keeps its newest `thread_ring_capacity - 1` samples. The collector pairs a stamp
+  once it is 2 ms old, so a ring has to hold 2 ms of its thread's output plus one
+  collector pass (up to ~15.6 ms on Windows when idle). The default 65536 covers ~3.5 M
+  stamps/s per thread; beyond that, overwritten samples count as `dropped`.
+- `prepare_thread()` claims the calling thread's ring and faults its pages in, so neither
+  lands inside the first measurement. `start()` does it for its own thread.
+- The rings take `max_thread_rings × thread_ring_capacity × 16` bytes of address space
+  (64 MiB by default, at most 2 GiB), touched only as they are used. In the shared modes
+  they live in the `.meta` segment, and a producer must use the collector's two
+  settings. A local restart with the same two settings takes the previous session's
+  rings back rather than allocating new ones, unless a DLL that attached to that session
+  has not attached since (see [Important constraints](#important-constraints)).
+
 ### Record a value
 
 Not everything worth watching is a duration. A value sample has no begin and no end —
@@ -294,7 +322,7 @@ converts the way the language says and comes out as a very large one.
 
 It is also the cheapest thing in the library. The expensive part of a stamp is the
 serialized TSC read, and a value has no use for a timestamp, so `value()` is the null
-check and the 16-byte publish and nothing else — ~30 cycles against ~200.
+check and the 16-byte publish and nothing else — ~16 cycles against ~170.
 
 Value points come out of the same id space as span points and are named the same way
 (`name_of(point, kBeginStep)`). Give a point values or spans, not both: the two would
@@ -356,12 +384,16 @@ the last process attached):
   session left its segments behind. `start()` returns `true` and it stamps at full cost
   into a ring nothing drains until a collector comes back. "Costs nothing without a
   collector" holds only for a name with no segments.
-- A name keeps the `queue_capacity`, `max_names` and labels it was created with. To
-  change any of them — or simply to clean up — remove it first:
+- A name keeps the `queue_capacity`, `max_names`, thread ring settings and labels it was
+  created with. To change any of them — or simply to clean up — remove it first:
 
 ```cpp
 slick::perfmon::collector::remove_shm("trading_perf");   // ring + control block
 ```
+
+**The collector reclaims rings from a producer that dies.** At every flush it checks
+whether each ring's process still exists. For one that is gone, it drains what was
+published and frees the ring for the next thread.
 
 ### Environment overrides
 
@@ -406,6 +438,9 @@ template <point_like T> void step (T point, uint8_t n, span_seq seq = kNoSeq) no
 template <point_like T> void end  (T point, span_seq seq = kNoSeq) noexcept;
 template <point_like T> void value(T point, uint64_t v) noexcept;   // no span, no timestamp
 
+void prepare_thread() noexcept;                    // claim this thread's ring up front
+void attach(const detail::session*) noexcept;      // a DLL stamping into the host's session
+
 class ScopedSample { ... };     // begin on construction, end on destruction
 
 class Collector {
@@ -432,6 +467,9 @@ class Collector {
     uint64_t last_flush_cycles() const noexcept;
     size_t   peak_open_spans() const noexcept;
     uint32_t name_conflicts() const noexcept;        // names two peers disagreed on
+
+    const detail::session* session() const noexcept; // what attach() takes
+    sample_queue* ring() const noexcept;             // the shared ring, for threads past the cap
 };
 
 }
@@ -450,19 +488,28 @@ class Collector {
 - **The ring overwrites; it never blocks.** A producer that outruns the collector loses
   samples, and a lost stamp corrupts *pairing* rather than just perturbing one number.
   Check `dropped` first whenever `orphan` or `abandoned` climb, and raise
-  `queue_capacity`. The overwrite itself is safe — producer and collector touch a
-  contended slot through relaxed atomics, so the overlap is defined rather than a data
-  race — but a sample it catches mid-write can mix two generations of the slot, which is
-  one more reason `dropped` has to be read before the latencies beside it.
-- **One collector has a throughput ceiling.** Draining and pairing an event is cheaper
-  than stamping one — ~90 cycles against ~200 — but there is one collector and as many
-  producers as you instrument, and the collector also sweeps, aggregates and writes. In
-  the benchmark, one or two threads stamping flat out on a single point (~15.5 M
-  stamps/s in total) drop nothing; four threads (~24 M stamps/s) overrun the ring and
-  start dropping, whatever its size. The ring buys you burst absorption, not unlimited
-  sustained rate. The contract is not "never drops", it is "never drops silently":
-  instrument the paths you care about rather than everything, and read the anomaly
-  counters before trusting a figure.
+  `thread_ring_capacity` (or `queue_capacity` for threads past the ring cap). The
+  overwrite itself is safe — producer and collector touch a contended slot through
+  relaxed atomics, so the overlap is defined rather than a data race — but a sample it
+  catches mid-write can mix two generations of the slot, which is one more reason
+  `dropped` has to be read before the latencies beside it.
+- **One collector has a throughput ceiling.** Producers don't limit each other: in the
+  benchmark eight threads stamp flat out at ~120 M stamps/s in total. But there is one
+  collector, pairing at ~90 cycles an event (~35 M events/s) while it also sweeps,
+  aggregates and writes. The rings absorb bursts, and the collector sets the sustained
+  rate. So the library can drop samples, but it never drops them silently: instrument
+  the paths you care about rather than everything, and read the anomaly counters before
+  trusting a figure.
+- **Stamps are paired 2 ms late, and a thread stalled mid-stamp for longer can misorder
+  a span.** Merging rings by timestamp means waiting until no ring can still hold an
+  older stamp. `flush()`, `snapshot()` and `shutdown()` wait at least ~20 µs instead:
+  they pair everything stamped before the call and leave anything stamped after it for
+  the next pass, so a thread that keeps stamping cannot hold them up. If a thread is
+  preempted for more than 2 ms between reading the TSC and publishing, its stamp arrives
+  late. When the span's other stamps came from another thread they have already been
+  paired, and the span shows up as `orphan` and `abandoned`. Threads past the ring cap
+  are sorted by timestamp too, so a backwards TSC on one of them reads as `orphan`, not
+  `invalid`.
 - **The id space is shared in shm mode.** Give each process a disjoint range, or share
   ids deliberately so the numbers merge. Two processes publishing different names for
   one id is reported as a conflict, and the first name wins.
@@ -480,12 +527,22 @@ class Collector {
   reads 0 there, and `subtract_overhead` can measure an overhead larger than a whole
   span and clamp every stage to zero. Leave it off on those platforms; the per-stamp
   figures in this README are x86 numbers and say so.
-- **`shutdown()` must not race with active instrumentation.** Retired rings are held
-  until the `Collector` is destroyed, so a stamp in flight across `shutdown()` is safe;
-  one in flight across `~Collector` is not. A shared ring is the exception: restarting on
-  the same `shm_name` drops the retired mapping first, so the object is not left holding
-  a second mapping of a segment it is about to open again. Only a stamp still in flight
-  across that whole restart is exposed.
+- **`shutdown()` must not race with active instrumentation.** Retired sessions, rings
+  included, are held until the `Collector` is destroyed, so a stamp in flight across
+  `shutdown()` is safe; one in flight across `~Collector` is not. A shared ring is the
+  exception: restarting on the same `shm_name` drops the retired mapping first, so the
+  object is not left holding a second mapping of a segment it is about to open again.
+  Only a stamp still in flight across that whole restart is exposed. Thread rings are
+  reused by slot rather than freed - the next local session takes the table back, and a
+  shared table outlives every session - so a stamp in flight across `shutdown()` can
+  land in a ring another thread has claimed since. That costs one misattributed sample,
+  never memory safety.
+- **A DLL that stamped into the host's session must attach again after the host
+  restarts**, whether it got there through `attach()` or by binding through
+  `Collector::session()`. Each module has its own hot path, so until it does, its stamps
+  go to the ended session and are not recorded. The host does not reuse that session's
+  thread rings while the DLL may still write them, so one that never attaches again
+  holds one table back for good.
 - **Shared segments are never removed implicitly.** Neither `shutdown()` nor
   `~Collector` unlinks the ring (`<shm_name>`) or the control block (`<shm_name>.meta`),
   and since 2.3.0 slick-queue does not either: none of them can know whether a producer
@@ -494,12 +551,13 @@ class Collector {
   segment outlives every process that mapped it, so after a session `/dev/shm/<shm_name>`
   and `/dev/shm/<shm_name>.meta` are still there and the name stays bound to what it was
   created with: a later session with a different `queue_capacity` throws "Shared memory
-  size mismatch", one with a different `max_names` throws a control-block mismatch, and a
-  point keeps the label first published for it (a different one is counted in
-  `name_conflicts()`). `Collector::remove_shm("<shm_name>")` removes both segments and
-  gives the name a clean start; call it from whatever coordinates the session, once no
-  peer will attach again. On Windows a segment is freed with its last handle, so it
-  persists only while some process is still attached and there is nothing to remove.
+  size mismatch", one with a different `max_names` or thread ring settings throws a
+  control-block mismatch, and a point keeps the label first published for it (a
+  different one is counted in `name_conflicts()`). `Collector::remove_shm("<shm_name>")`
+  removes both segments and gives the name a clean start; call it from whatever
+  coordinates the session, once no peer will attach again. On Windows a segment is
+  freed with its last handle, so it persists only while some process is still attached
+  and there is nothing to remove.
 - **Percentiles are approximate**, with a bounded relative error of ~3% at the default
   histogram precision. A percentile is the nearest rank - the smallest sample with at
   least p% of them at or below it, with no interpolation - so `p51` of two samples is the
@@ -536,12 +594,28 @@ class Collector {
 
 ## Architecture
 
-**Hot path.** One acquire load of a ring pointer — which doubles as the enabled flag, so
-there is no second check — then `LFENCE; RDTSC; LFENCE` for a begin or `RDTSCP; LFENCE`
-for anything else, then `reserve` / three stores / `publish`. That is the whole thing:
-no delta, no unit conversion, no lookup, no bounds branch, no thread-local state, no
-locks. Keeping the timestamp a raw 64-bit value is what removes the ~1.4 s ceiling a
-32-bit cycle delta would have imposed.
+**Hot path.** One acquire load of the session pointer, which doubles as the enabled flag
+so there is no second check. Then a compare against the thread's cached session id,
+`LFENCE; RDTSC; LFENCE` for a begin or `RDTSCP; LFENCE` for anything else, three relaxed
+stores into the thread's ring and a release store of its head. That is the whole thing:
+no read-modify-write, no delta, no unit conversion, no bounds branch, no locks. The ring
+lookup goes before the timestamp for a begin and after it for anything else, so it stays
+outside the measured interval either way. Keeping the timestamp a raw 64-bit value is
+what removes the ~1.4 s ceiling a 32-bit cycle delta would have imposed.
+
+**Rings.** Each thread's ring has a single producer and the collector only reads it, so
+nothing a publish writes is written by anyone else. The collector reads the head once
+per pass, and the producer keeps its own copy, so a publish never has to load it. The
+shared multi-producer ring stays for threads past `max_thread_rings`.
+Claiming a ring is one compare-and-swap on a slot holding the claimant's pid, so a
+producer that dies leaves enough behind for the collector to reclaim the ring.
+
+**Merge.** Each ring is in timestamp order already, so the collector merges them with a
+small heap, pairing a stamp only once it is 2 ms old. The hold-back lets a span cross
+threads: a begin stamped just before a pass may not be visible yet, and pairing its end
+first would orphan it. The ring keeps its newest `capacity - 1` samples, because
+after copying a chunk the collector reads the head again and discards whatever the
+producer may have reached meanwhile, counting it as `dropped`.
 
 Intermediate stamps use `RDTSCP` because an intermediate stamp is simultaneously the
 close of one stage and the open of the next: it has to wait for prior work to retire
@@ -588,6 +662,9 @@ sample, so paying the producer an atomic load per stamp to wake the collector pr
 would be a straight loss, and it could not work across processes anyway. On Windows the
 1 ms poll is really the ~15.6 ms timer granularity, which is exactly what is wanted: the
 ring is sized to absorb that much production and the collector costs almost no CPU.
+When busy, it still waits at least 50 µs between passes. Every read of a ring costs its
+producer a cache miss on its next stamp, and a collector polling flat out turns that
+into nearly every stamp.
 
 ## Output
 
@@ -712,23 +789,42 @@ unpinned. Minimum of 15 repetitions of 20,000 iterations; run-to-run spread is a
 
 | Case | cycles/stamp | ns/stamp |
 |---|---|---|
-| Single stamp, fenced (default) | 205 | ~62 |
-| `begin`/`end` pair, fenced | 197 | ~60 |
-| `begin`/`end` pair with a runtime `seq` | 186 | ~57 |
-| 5-stage pipeline, 6 stamps | 195 | ~59 |
-| `SLICK_PERFMON_SCOPE` guard | 191 | ~58 |
-| Single stamp, `SLICK_PERFMON_SERIALIZE=0` | 172 | ~52 |
-| `begin`/`end` pair, `SLICK_PERFMON_SERIALIZE=0` | 130 | ~39 |
-| Value sample (`value()`, no timestamp) | **29** | ~9 |
+| Single stamp, fenced (default) | 172 | ~52 |
+| `begin`/`end` pair, fenced | 171 | ~52 |
+| `begin`/`end` pair with a runtime `seq` | 168 | ~51 |
+| 5-stage pipeline, 6 stamps | 194 | ~59 |
+| `SLICK_PERFMON_SCOPE` guard | 169 | ~51 |
+| Single stamp, `SLICK_PERFMON_SERIALIZE=0` | 128 | ~39 |
+| `begin`/`end` pair, `SLICK_PERFMON_SERIALIZE=0` | 95 | ~29 |
+| Value sample (`value()`, no timestamp) | **16** | ~5 |
 | Runtime-disabled | **2.5** | ~0.8 |
 | Compile-time disabled (`SLICK_PERFMON_ENABLED=0`) | **0.0** | **0.0** |
 
-Four things worth reading off that table:
+The next table has other threads stamping at the same time, in cycles, against v0.3.0's
+single shared ring. "Publish" is the per-call cost of one `value()`, with the two fenced
+TSC reads around it subtracted. "Span overhead" is what the stamps add to a measured
+span (begin, a 1000-cycle spin, end): the collector's own figure less the spin.
 
-- **Per-stamp cost is flat.** A six-stamp pipeline costs the same per stamp as a single
-  one, which is what makes multi-step spans worth using.
+The value sample above (16) and a one-thread publish below (51) are the same call. 16 is
+its cost in a tight loop with the cache hot. 51 is one call on its own after a gap, timed
+through a fenced bracket that rounds to the counter's 33-cycle tick, so cache misses and
+that rounding are in it.
+
+| Threads | publish mean, v0.3.0 → now | publish p50 | span overhead mean | span overhead p99 |
+|---|---|---|---|---|
+| 1 | 127 → 51 | 66 → 33 | 506 → 397 | 760 → 504 |
+| 2 | 303 → 52 | 264 → 33 | 660 → 407 | 824 → 504 |
+| 4 | 359 → 57 | 297 → 33 | 729 → 429 | 952 → 504 |
+| 8 | 429 → 68 | 297 → 66 | 845 → 448 | 1112 → 504 |
+
+Five things worth reading off those tables:
+
+- **Per-stamp cost is flat.** A six-stamp pipeline costs about the same per stamp as a
+  single one, which is what makes multi-step spans worth using.
+- **It stays flat across threads.** In v0.3.0 each thread's stamps moved the shared
+  ring's counter between cores, and that cost landed inside the spans being measured.
 - **Most of a stamp is the timestamp.** A value sample is the same publish without the
-  serialized TSC read in front of it, and costs about a seventh as much.
+  serialized TSC read in front of it, and costs about a tenth as much.
 - **A runtime `seq` is free.** No worse than the unkeyed pair, confirming the
   RDTSC-versus-RDTSCP choice stays a compile-time decision even when the caller passes a
   runtime correlation id.
@@ -741,13 +837,13 @@ Four things worth reading off that table:
 ### An honest comparison with `std::chrono`
 
 In the same benchmark, a bare `steady_clock::now()` pair costs **~300 cycles (~150 per
-call)** on this machine. A slick-perfmon `begin`/`end` pair costs ~395. **slick-perfmon
+call)** on this machine. A slick-perfmon `begin`/`end` pair costs ~340. **slick-perfmon
 is not cheaper than reading the clock**, and on Linux, where `steady_clock` is a vDSO
 `clock_gettime` at roughly 70 cycles, it is clearly more expensive per timestamp.
 
 What it buys instead:
 
-- **The stamp is the entire cost, permanently.** Those ~200 cycles already include
+- **The stamp is the entire cost, permanently.** Those ~170 cycles already include
   handing the sample off; `steady_clock::now()` gives you a number you still have to store,
   pair and aggregate. Add a min/max/histogram update to the measured thread and it is no
   longer close — and that cost grows with every statistic you want, while this one does
@@ -765,12 +861,12 @@ inline, `std::chrono` is the simpler tool and this library has nothing to offer 
 
 Part of a stamp's cost lands inside every measured stage: the tail of one stamp plus the
 head of the next. `Collector::overhead_cycles()` reports it, measured at startup as the
-minimum over a thousand back-to-back stamps (typically ~165 cycles here).
+minimum over a thousand back-to-back stamps (typically ~130 cycles here).
 
 `config::subtract_overhead` will subtract it, but it is **off by default**. The
-calibration runs against a private, uncontended ring; on the live ring the producer
-contends with the collector for the reservation counter and the slot's cache line, and
-in practice costs around twice the calibrated figure. Subtracting a number that is
+calibration is the minimum over back-to-back stamps against a private ring whose lines
+never leave the core. On a live ring the collector's reads cost the producer the odd
+cache miss, so a typical stamp runs above it. Subtracting a number that is
 systematically low leaves a residue that is invisible, whereas reporting raw cycles
 leaves the overhead visible and lets `overhead_cycles()` tell you where the floor is.
 
@@ -838,6 +934,11 @@ desktop is roughly 10%, so treat anything smaller as noise; the min is the numbe
 trust, since no sample can come in under the true cost but any sample can be inflated by
 an interrupt.
 
+Two blocks measure contention: the per-call cost of one publish while 1 to 8 threads
+publish at a realistic rate, and what the stamps add to a measured span at the same
+thread counts. The throughput table beside them is a flat-out race, so it measures how
+fast the rings fill rather than what a stamp costs.
+
 The last block measures the collector rather than the hot path: pairing one drained
 event, accumulating one drained value (~65 cycles against ~90 for a paired stamp, as it
 skips the span table), expiring abandoned spans, and rebuilding the report rows. None of it is part of
@@ -857,8 +958,7 @@ Pre-define any of these, or set them via `target_compile_definitions`:
 
 ## Future work
 
-- Auto-generated `seq` values. Today the caller supplies one; generating one would need
-  either a contended atomic or the thread-local state this design exists to avoid.
+- Auto-generated `seq` values. Today the caller supplies one.
 - Hierarchical spans with parent/child attribution and flame-graph output.
 - A raw per-event dump for offline analysis.
 - Native ARM cycle counters (`CNTVCT_EL0`).

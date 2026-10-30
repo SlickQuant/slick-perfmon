@@ -25,6 +25,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
@@ -35,11 +36,18 @@
 #include <locale>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <ostream>
 #include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
+
+#if !defined(_WIN32)
+#include <cerrno>
+#include <signal.h>
+#include <unistd.h>
+#endif
 
 namespace slick::perfmon {
 
@@ -397,6 +405,7 @@ public:
         if (!open_transport()) {
             return false;
         }
+        create_session();
 
         // Anchor the read cursor here, not on the collector thread. The thread
         // calibrates the TSC before its first drain, and anything stamped
@@ -414,10 +423,16 @@ public:
             thread_ = std::thread([this] { run(); });
         }
 
-        // Publish the ring to this module's hot path last, so no stamp can land
-        // before the collector is ready to pair it.
+        // Publish the session to this module's hot path last, so no stamp can
+        // land before the collector is ready to pair it.
         enabled_.store(true, std::memory_order_relaxed);
-        attach(ring_.get());
+        detail::bind_module(session_.get());
+        // The thread starting a collector process usually never stamps, and in
+        // a shared table a ring it claimed would sit idle where every producer
+        // can see it. It still claims one lazily if it does stamp.
+        if (cfg_.run_mode != mode::shared_collector) {
+            prepare_thread();
+        }
         return true;
     }
 
@@ -428,7 +443,7 @@ public:
 
         // Detach producers in this module first, so the final drain sees a
         // quiescent ring.
-        attach(nullptr);
+        detail::bind_module(nullptr);
         enabled_.store(false, std::memory_order_relaxed);
 
         if (thread_.joinable()) {
@@ -436,22 +451,35 @@ public:
             thread_.join();
         }
 
-        // The ring is retired rather than freed. A thread that loaded the hot
+        // The session is retired rather than freed. A thread that loaded the hot
         // pointer just before the detach above may still be inside stamp(), and
         // freeing under it would be a use-after-free. Holding it until this
-        // Collector is destroyed costs one allocation per start/shutdown cycle
-        // and removes the common case of that race. A stamp still in flight
-        // when ~Collector runs remains the caller's responsibility to avoid.
+        // Collector is destroyed costs one shared ring per start/shutdown cycle
+        // (the next local session takes the thread rings back unless another
+        // module may still stamp into them; see take_retired_table()) and
+        // removes the common case of that race. A stamp still in flight when
+        // ~Collector runs remains the caller's responsibility to avoid.
         //
         // A shared ring is also remembered by name, so open_transport() can
         // drop this stale mapping when a later session opens that name again.
         //
         // Nothing is unlinked, here or below: both segments are left for the
         // next session, or a producer still running, to find. See remove_shm().
-        if (ring_) {
-            retired_rings_.push_back({std::move(ring_), cfg_.run_mode == mode::local
-                                                            ? std::string{}
-                                                            : cfg_.shm_name});
+        // Rings this session's threads still hold go back now: their threads
+        // rebind to whatever session comes next, and in a shared table a
+        // collector frees them once drained. Only this session's, since another
+        // module in this process may share the table.
+        if (session_) {
+            const detail::ring_table& t = session_->rings;
+            for (uint32_t i = 0; i < t.count(); ++i) {
+                t.retire(i, session_->owner);
+            }
+        }
+        if (ring_ || session_) {
+            const bool shared = cfg_.run_mode != mode::local;
+            retired_rings_.push_back({std::move(ring_), shared ? cfg_.shm_name : std::string{},
+                                      std::move(session_), std::move(table_),
+                                      shared ? control_.release_mapping() : nullptr});
         }
         control_.reset();
 
@@ -524,7 +552,9 @@ public:
             return;
         }
         enabled_.store(on, std::memory_order_relaxed);
-        attach(on ? ring_.get() : nullptr);
+        // Only the switch. `live` stays, so a thread exiting while disabled
+        // still hands its ring back.
+        detail::g_hot.current.store(on ? session_.get() : nullptr, std::memory_order_release);
     }
 
     bool enabled() const noexcept { return started_ && enabled_.load(std::memory_order_relaxed); }
@@ -614,11 +644,51 @@ public:
     /// long for a slot.
     uint32_t name_conflicts() const noexcept { return name_conflicts_; }
 
+    /// The shared ring: threads past max_thread_rings, or all of them with
+    /// thread rings off.
     sample_queue* ring() const noexcept { return ring_.get(); }
+
+    /// What another module passes to attach() to stamp into this collector.
+    /// Belongs to this session only: after a restart, attach() the new one.
+    const detail::session* session() const noexcept { return session_.get(); }
 
     const config& configuration() const noexcept { return cfg_; }
 
 private:
+    // ------------------------------------------------------------------
+    // Merge types and tuning
+    // ------------------------------------------------------------------
+
+    /// Upper bounds on config::max_thread_rings, and on the memory it and
+    /// config::thread_ring_capacity add up to.
+    static constexpr uint32_t kMaxThreadRings     = 4096;
+    static constexpr uint64_t kMaxThreadRingBytes = uint64_t{2} << 30;
+    /// Samples copied out of a ring per read.
+    static constexpr size_t kMergeChunk = 256;
+    /// How old a stamp must be before an ordinary pass pairs it. Covers the
+    /// gap between a producer reading the TSC and its publish becoming visible.
+    static constexpr std::chrono::microseconds kHoldBack{2000};
+    /// Least time between two passes that found work.
+    static constexpr std::chrono::microseconds kMinPassGap{50};
+    /// Larger than the skew between cores on a machine with a synchronised TSC
+    /// (see invariant_tsc()). A flush pairs stamps up to this far ahead of the
+    /// collector's clock, so it includes one made before the flush on a core
+    /// running ahead.
+    static constexpr std::chrono::microseconds kSkewMargin{10};
+    static constexpr uint32_t kSharedSource = std::numeric_limits<uint32_t>::max();
+    static constexpr uint64_t kNoStop       = std::numeric_limits<uint64_t>::max();
+
+    /// One input to the merge: the chunk being consumed from a ring, or the
+    /// staged shared-ring stamps.
+    struct MergeSource {
+        const sample* data = nullptr;
+        size_t        size = 0;
+        size_t        pos  = 0;
+        uint64_t      base = 0;        ///< ring index of data[0]
+        uint64_t      stop = kNoStop;  ///< ring index this pass reads up to; set on its first read
+        uint32_t      ring = 0;        ///< or kSharedSource
+    };
+
     // ------------------------------------------------------------------
     // Singleton plumbing
     // ------------------------------------------------------------------
@@ -665,6 +735,26 @@ private:
         if (cfg_.queue_capacity < 2 || (cfg_.queue_capacity & (cfg_.queue_capacity - 1)) != 0) {
             throw std::invalid_argument(
                 "slick-perfmon: queue_capacity must be a power of two and at least 2");
+        }
+        if (cfg_.max_thread_rings > 0 &&
+            (cfg_.thread_ring_capacity < 2 ||
+             (cfg_.thread_ring_capacity & (cfg_.thread_ring_capacity - 1)) != 0)) {
+            throw std::invalid_argument(
+                "slick-perfmon: thread_ring_capacity must be a power of two and at least 2");
+        }
+        if (cfg_.max_thread_rings > kMaxThreadRings) {
+            throw std::invalid_argument("slick-perfmon: max_thread_rings is at most " +
+                                        std::to_string(kMaxThreadRings));
+        }
+        // Checked here so an oversized table is named, rather than surfacing
+        // as a bad_alloc or a segment that will not open.
+        const uint64_t ring_bytes = uint64_t{cfg_.max_thread_rings} * cfg_.thread_ring_capacity *
+                                    sizeof(sample);
+        if (ring_bytes > kMaxThreadRingBytes) {
+            throw std::invalid_argument(
+                "slick-perfmon: max_thread_rings x thread_ring_capacity x 16 bytes is " +
+                std::to_string(ring_bytes >> 20) + " MiB, and the limit is " +
+                std::to_string(kMaxThreadRingBytes >> 20) + " MiB");
         }
         if (cfg_.run_mode != mode::local && cfg_.shm_name.empty()) {
             throw std::invalid_argument("slick-perfmon: the shared modes require a shm_name");
@@ -779,13 +869,15 @@ private:
 
         case mode::shared_collector:
             ring_ = std::make_unique<sample_queue>(cfg_.queue_capacity, cfg_.shm_name.c_str());
-            return control_.create_shared(meta, cfg_.max_names);
+            return control_.create_shared(meta, cfg_.max_names, cfg_.max_thread_rings,
+                                          cfg_.thread_ring_capacity);
 
         case mode::shared_producer:
             if (cfg_.create_if_absent) {
                 ring_ = std::make_unique<sample_queue>(cfg_.queue_capacity,
                                                         cfg_.shm_name.c_str());
-                return control_.create_shared(meta, cfg_.max_names);
+                return control_.create_shared(meta, cfg_.max_names, cfg_.max_thread_rings,
+                                              cfg_.thread_ring_capacity);
             }
             // Attach only. Nobody there is the safe default: the producer stays
             // silent and free rather than filling a ring nothing drains.
@@ -797,9 +889,126 @@ private:
             }
             // Outside the catch on purpose: a mismatch here is a misconfigured
             // peer, not an absent collector.
-            return control_.attach_shared(meta, cfg_.max_names);
+            return control_.attach_shared(meta, cfg_.max_names, cfg_.max_thread_rings,
+                                          cfg_.thread_ring_capacity);
         }
         return false;
+    }
+
+    /// Build what the hot path publishes into: the shared ring plus a table of
+    /// per-thread rings, on the heap in local mode and after the names in the
+    /// shared control block otherwise.
+    void create_session() {
+        auto s     = std::make_unique<detail::session>();
+        s->id      = next_session_id();
+        s->shared  = ring_.get();
+        s->creator = &detail::g_hot;
+
+        const uint32_t n   = cfg_.max_thread_rings;
+        const uint32_t cap = cfg_.thread_ring_capacity;
+        if (n > 0 && cfg_.run_mode == mode::local) {
+            if (void* mem = take_retired_table(n, cap)) {
+                s->rings.reuse(mem);
+            } else {
+                const size_t bytes = detail::ring_table::bytes_for(n, cap);
+                table_.reset(static_cast<std::byte*>(::operator new(bytes, std::align_val_t{64})));
+                s->rings.create(table_.get(), n, cap);
+            }
+        } else if (n > 0) {
+            s->rings.adopt(control_.rings());
+        }
+        s->owner = detail::ring_owner(current_pid(), n > 0 ? s->rings.take_tag() : 0,
+                                      detail::kRingActive);
+        // From now, as the shared ring's cursor is: a ring in a segment that
+        // outlived an earlier collector already holds what that one read.
+        ring_cursor_.resize(n);
+        for (uint32_t i = 0; i < n; ++i) {
+            ring_cursor_[i] = s->rings.slot(i).head.load(std::memory_order_acquire);
+        }
+        ring_wait_ts_.assign(n, 0);
+        merge_scratch_.resize(static_cast<size_t>(n) * kMergeChunk);
+        sources_.clear();
+        sources_.reserve(static_cast<size_t>(n) + 1);
+        heap_.clear();
+        heap_.reserve(static_cast<size_t>(n) + 1);
+        shared_stage_.clear();
+        shared_stage_.reserve(cfg_.queue_capacity);
+        session_ = std::move(s);
+    }
+
+    /**
+     * @brief The thread rings of an ended local session of this geometry,
+     *        moved back into table_, or null when there is none.
+     *
+     * A local session's table is retired with it rather than freed, because a
+     * stamp may still be in flight into it. Allocating afresh on every restart
+     * would then hold max_thread_rings x thread_ring_capacity x 16 bytes per
+     * restart until the Collector dies; taking the old one back holds one per
+     * geometry. The retired session keeps pointing at it, so a late stamp
+     * stays in valid memory - see ring_table::reuse() for what it costs.
+     *
+     * Not while another module that stamped into it may still be doing so:
+     * its writers are its own, this one cannot reset them, and in rings handed
+     * out afresh they would rewind the heads. See modules_moved_on().
+     */
+    void* take_retired_table(uint32_t rings, uint32_t capacity) {
+        for (size_t i = 0; i < retired_rings_.size(); ++i) {
+            RetiredRing& r = retired_rings_[i];
+            if (r.table && r.shm_name.empty() && r.session &&
+                r.session->rings.count() == rings && r.session->rings.capacity() == capacity &&
+                modules_moved_on(i)) {
+                table_ = std::move(r.table);
+                return table_.get();
+            }
+        }
+        return nullptr;
+    }
+
+    /**
+     * @brief Whether every other module that stamped into retired session
+     *        @p i has since stamped into a later one.
+     *
+     * Such a module stamps into the session its own hot state names, so once
+     * it is in a later one its threads rebind there on their next stamp and
+     * stop writing this session's rings. One that never moves on (it did not
+     * attach again, or was unloaded) holds this table back for good.
+     *
+     * Linear in the retired sessions, and only called for one that still owns
+     * a table of the right geometry.
+     */
+    bool modules_moved_on(size_t i) const noexcept {
+        const detail::session& s = *retired_rings_[i].session;
+        if (s.modules_full.load(std::memory_order_relaxed)) {
+            return false;
+        }
+        for (const auto& m : s.modules) {
+            const void* mod = m.load(std::memory_order_relaxed);
+            if (mod == nullptr) {
+                continue;
+            }
+            bool later = false;
+            for (size_t j = i + 1; j < retired_rings_.size() && !later; ++j) {
+                later = retired_rings_[j].session && retired_rings_[j].session->has_module(mod);
+            }
+            if (!later) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /// Unique per session across modules, and never 0, which means "unbound".
+    static uint64_t next_session_id() noexcept {
+        static std::atomic<uint64_t> n{0};
+        return (detail::rdtsc_begin() << 8) ^ (n.fetch_add(1, std::memory_order_relaxed) + 1);
+    }
+
+    static uint32_t current_pid() noexcept {
+#if defined(_WIN32)
+        return static_cast<uint32_t>(::GetCurrentProcessId());
+#else
+        return static_cast<uint32_t>(::getpid());
+#endif
     }
 
     /**
@@ -843,6 +1052,7 @@ private:
     void reset_session_counters() noexcept {
         stalled_slots_     = 0;
         last_loss_         = 0;
+        ring_lost_         = 0;
         reported_stalled_  = 0;
         overflow_baseline_ = PointAnomalies{};
         stalled_since_     = {};
@@ -874,6 +1084,10 @@ private:
         }
 
         reset_session_counters();
+        holdback_cycles_ = static_cast<uint64_t>(
+            clock_.hz() * std::chrono::duration<double>(kHoldBack).count());
+        skew_cycles_ = static_cast<uint64_t>(
+            clock_.hz() * std::chrono::duration<double>(kSkewMargin).count());
 
         // Sized like the stage table, which bounds all three: a run cannot
         // report more stages than it can accumulate, and it cannot touch more
@@ -898,6 +1112,7 @@ private:
         constexpr uint32_t kIdleYieldLimit = 64;
 
         while (running_.load(std::memory_order_acquire)) {
+            const auto pass_start = std::chrono::steady_clock::now();
             const bool progressed = drain_once();
 
             const auto now = std::chrono::steady_clock::now();
@@ -908,12 +1123,18 @@ private:
 
             const uint64_t req = flush_request_.load(std::memory_order_acquire);
             if (req != flush_done_.load(std::memory_order_relaxed)) {
+                merge_pass(flush_watermark());
                 do_flush(std::chrono::steady_clock::now());
                 flush_done_.store(req, std::memory_order_release);
             }
 
             if (progressed) {
                 idle = 0;
+                // Every read of a ring costs its producer a miss on its next
+                // stamp, so passes are spaced rather than run back to back.
+                while (std::chrono::steady_clock::now() - pass_start < kMinPassGap) {
+                    std::this_thread::yield();
+                }
             } else if (idle < kIdleYieldLimit) {
                 ++idle;
                 std::this_thread::yield();
@@ -932,18 +1153,197 @@ private:
         write_summary_file();
     }
 
+    /// One ordinary pass: everything stamped more than kHoldBack ago.
     bool drain_once() {
-        if (!drain_ready()) {
-            check_stall();
-            return false;
-        }
-        stalled_since_ = {};
-        return true;
+        const uint64_t now = detail::rdtsc_step();
+        return merge_pass(now > holdback_cycles_ ? now - holdback_cycles_ : 0);
     }
 
-    /// One read from the cursor into the pairer. False means nothing is
-    /// published there yet - the ring is empty, or the cursor sits on a hole.
-    bool drain_ready() {
+    /**
+     * @brief The watermark of a flush pass: past every stamp made before the
+     *        call, returned once the stamps under it should all be published.
+     *
+     * kSkewMargin ahead of this core's TSC takes in a stamp read on a core
+     * running ahead. Waiting until the TSC is another margin past that covers
+     * a core running behind, so a span crossing threads is not read end first.
+     * Not a guarantee: a thread preempted between its TSC read and its publish
+     * for longer than that still misses this flush, as it would miss the
+     * hold-back. Costs the flush at least 2 x kSkewMargin; stamps after the
+     * watermark wait for the next pass, so a producer that keeps stamping
+     * cannot hold the flush.
+     */
+    uint64_t flush_watermark() const {
+        const uint64_t w = detail::rdtsc_step() + skew_cycles_;
+        while (detail::rdtsc_step() < w + skew_cycles_) {
+            std::this_thread::yield();
+        }
+        return w;
+    }
+
+    /**
+     * @brief Pair every stamp older than @p watermark, in timestamp order.
+     *
+     * Each thread ring is already in timestamp order, so a heap over the
+     * sources merges them; the shared ring is staged and sorted first. Stamps
+     * at or past the watermark stay where they are for the next pass: one
+     * stamped just before a pass may not be visible yet, and the hold-back
+     * keeps a span that crosses threads from pairing out of order.
+     * Values carry no timestamp and go straight to the pairer.
+     *
+     * @return whether anything was read.
+     */
+    bool merge_pass(uint64_t watermark) {
+        bool progressed = read_shared();
+
+        sources_.clear();
+        const auto stage_end =
+            std::lower_bound(shared_stage_.begin(), shared_stage_.end(), watermark,
+                             [](const sample& s, uint64_t w) { return s.timestamp < w; });
+        if (stage_end != shared_stage_.begin()) {
+            MergeSource src;
+            src.data = shared_stage_.data();
+            src.size = static_cast<size_t>(stage_end - shared_stage_.begin());
+            src.ring = kSharedSource;
+            sources_.push_back(src);
+        }
+        const uint32_t rings = session_->rings.count();
+        for (uint32_t i = 0; i < rings; ++i) {
+            // Still waiting on a stamp too young to pair: leave the ring alone.
+            // Reading it again would only pull the producer's lines away.
+            if (ring_wait_ts_[i] >= watermark) {
+                continue;
+            }
+            MergeSource src;
+            src.ring = i;
+            src.base = ring_cursor_[i];
+            if (next_stamp(src, watermark, progressed)) {
+                sources_.push_back(src);
+            }
+        }
+        if (!sources_.empty()) {
+            progressed = true;
+        }
+
+        if (sources_.size() == 1) {
+            MergeSource& src = sources_[0];
+            do {
+                pairer_.on_event(src.data[src.pos++]);
+            } while (next_stamp(src, watermark, progressed));
+        } else if (!sources_.empty()) {
+            // Min-heap on each source's next timestamp.
+            auto later = [this](uint32_t a, uint32_t b) {
+                return sources_[a].data[sources_[a].pos].timestamp >
+                       sources_[b].data[sources_[b].pos].timestamp;
+            };
+            heap_.clear();
+            for (uint32_t i = 0; i < sources_.size(); ++i) {
+                heap_.push_back(i);
+            }
+            std::make_heap(heap_.begin(), heap_.end(), later);
+            while (!heap_.empty()) {
+                std::pop_heap(heap_.begin(), heap_.end(), later);
+                MergeSource& src = sources_[heap_.back()];
+                pairer_.on_event(src.data[src.pos++]);
+                if (next_stamp(src, watermark, progressed)) {
+                    std::push_heap(heap_.begin(), heap_.end(), later);
+                } else {
+                    heap_.pop_back();
+                }
+            }
+        }
+
+        for (const MergeSource& src : sources_) {
+            if (src.ring == kSharedSource) {
+                shared_stage_.erase(shared_stage_.begin(),
+                                    shared_stage_.begin() + static_cast<ptrdiff_t>(src.pos));
+                progressed = true;
+            }
+        }
+        release_retired_rings();
+        return progressed;
+    }
+
+    /**
+     * @brief Move @p src onto its next stamp below @p watermark.
+     *
+     * Pairs any values it passes on the way and refills from the ring when the
+     * chunk runs out. When it stops, the ring's cursor is left on the first
+     * sample not consumed.
+     */
+    bool next_stamp(MergeSource& src, uint64_t watermark, bool& progressed) {
+        for (;;) {
+            while (src.pos < src.size) {
+                const sample& s = src.data[src.pos];
+                if (is_value_event(s.event)) {
+                    pairer_.on_event(s);
+                    ++src.pos;
+                    progressed = true;
+                    continue;
+                }
+                if (s.timestamp < watermark) {
+                    return true;
+                }
+                break;
+            }
+            if (src.ring == kSharedSource) {
+                return false;
+            }
+            uint64_t& cursor = ring_cursor_[src.ring];
+            cursor           = src.base + src.pos;
+            if (src.pos < src.size) {
+                ring_wait_ts_[src.ring] = src.data[src.pos].timestamp;
+                return false;  // stopped at the watermark
+            }
+            ring_wait_ts_[src.ring] = 0;
+            const detail::ring_view view = session_->rings.view(src.ring);
+            // No further than the head as this pass first found it. A producer
+            // can publish faster than the merge consumes (a value costs it ~16
+            // cycles), so reading until empty might never end.
+            if (src.stop == kNoStop) {
+                src.stop = view.head->load(std::memory_order_acquire);
+            }
+            sample* scratch = merge_scratch_.data() + static_cast<size_t>(src.ring) * kMergeChunk;
+            detail::ring_batch b;
+            for (;;) {
+                const uint64_t before = cursor;
+                const size_t   room   = src.stop > cursor
+                                            ? static_cast<size_t>((std::min)(
+                                                  src.stop - cursor, uint64_t{kMergeChunk}))
+                                            : 0;
+                b = detail::ring_read(view, cursor, scratch, room, ring_lost_);
+                if (b.size != 0 || cursor == before) {
+                    break;  // a batch, or nothing new; otherwise all of it was overwritten
+                }
+            }
+            if (b.size == 0) {
+                return false;
+            }
+            src.data   = b.data;
+            src.size   = b.size;
+            src.pos    = 0;
+            src.base   = cursor;
+        }
+    }
+
+    /// Read everything published to the shared ring: values to the pairer,
+    /// stamps into the stage in timestamp order. Bounded by one ring's worth,
+    /// so a producer outrunning the collector cannot keep the pass going.
+    bool read_shared() {
+        bool any = false;
+        for (uint32_t n = 0; n < cfg_.queue_capacity && read_shared_once(); ++n) {
+            any = true;
+        }
+        if (any) {
+            stalled_since_ = {};
+        } else {
+            check_stall();
+        }
+        return any;
+    }
+
+    /// One read from the shared cursor. False means nothing is published there
+    /// yet: the ring is empty, or the cursor sits on a hole.
+    bool read_shared_once() {
         uint64_t c = cursor_.load(std::memory_order_relaxed);
         auto [ptr, n] = ring_->read(c);
         cursor_.store(c, std::memory_order_release);
@@ -959,9 +1359,71 @@ private:
             // still reading fields out of it. load() takes one defined,
             // self-consistent copy; see sample::load().
             const sample s = ptr[i].load();
-            pairer_.on_event(s);
+            if (is_value_event(s.event) || session_->rings.count() == 0) {
+                // With no thread rings there is nothing to merge with, and
+                // reservation order is the order to pair in, as it always was.
+                pairer_.on_event(s);
+                continue;
+            }
+            // Threads past the ring cap, merged with the rings by timestamp.
+            // Reservation order is nearly that already, so this rarely moves
+            // anything. It does reorder one thread's stamps if its TSC ran
+            // backwards, which then reads as orphan and abandoned, not invalid.
+            shared_stage_.push_back(s);
+            for (size_t j = shared_stage_.size() - 1;
+                 j > 0 && shared_stage_[j - 1].timestamp > shared_stage_[j].timestamp; --j) {
+                std::swap(shared_stage_[j - 1], shared_stage_[j]);
+            }
         }
         return true;
+    }
+
+    /// Retire, on its behalf, every ring held by a producer process that is
+    /// gone; the merge then frees it once drained. Once per flush, because
+    /// asking the OS about a process is a system call.
+    void reclaim_dead_rings() {
+        if (cfg_.run_mode == mode::local) {
+            return;
+        }
+        const uint32_t            self = current_pid();
+        const detail::ring_table& t    = session_->rings;
+        for (uint32_t i = 0; i < t.count(); ++i) {
+            const uint64_t owner = t.slot(i).owner.load(std::memory_order_acquire);
+            if (detail::ring_state(owner) == detail::kRingActive &&
+                detail::ring_pid(owner) != self && !process_alive(detail::ring_pid(owner))) {
+                t.retire(i, owner);
+            }
+        }
+    }
+
+    static bool process_alive(uint32_t pid) noexcept {
+#if defined(_WIN32)
+        HANDLE h = ::OpenProcess(SYNCHRONIZE, FALSE, pid);
+        if (h == nullptr) {
+            return ::GetLastError() == ERROR_ACCESS_DENIED;  // there, just not ours to open
+        }
+        const bool alive = ::WaitForSingleObject(h, 0) == WAIT_TIMEOUT;
+        ::CloseHandle(h);
+        return alive;
+#else
+        return ::kill(static_cast<pid_t>(pid), 0) == 0 || errno == EPERM;
+#endif
+    }
+
+    /// Free retired rings the merge has drained. The retire is a release after
+    /// the owner's last publish, so seeing it here means `head` is final.
+    void release_retired_rings() {
+        const uint32_t rings = session_->rings.count();
+        for (uint32_t i = 0; i < rings; ++i) {
+            const detail::ring_slot& slot  = session_->rings.slot(i);
+            const uint64_t           owner = slot.owner.load(std::memory_order_acquire);
+            if (detail::ring_state(owner) != detail::kRingRetired) {
+                continue;
+            }
+            if (ring_cursor_[i] >= slot.head.load(std::memory_order_acquire)) {
+                session_->rings.release(i, owner);
+            }
+        }
     }
 
     /**
@@ -1036,7 +1498,7 @@ private:
             std::chrono::steady_clock::now() + (std::min)(cfg_.stalled_sample_timeout, kFinalDrainGrace);
 
         while (cursor_.load(std::memory_order_relaxed) < target) {
-            if (drain_ready()) {
+            if (read_shared_once()) {
                 continue;
             }
             // Reloaded after the read, which owns the cursor: a hole is stepped
@@ -1052,6 +1514,10 @@ private:
             skip_hole(cur);
         }
         stalled_since_ = {};
+
+        // As a flush: a producer in another process is not detached and may
+        // still be stamping.
+        merge_pass(flush_watermark());
     }
 
     /**
@@ -1068,25 +1534,38 @@ private:
         constexpr int      kIters    = 1000;
         constexpr uint32_t kCapacity = 4096;  // > 2 * kIters, so nothing wraps
 
-        sample_queue cal(kCapacity);
-        for (int i = 0; i < kIters; ++i) {
-            detail::stamp_into<true>(cal, 0, make_event(kBeginStep));
-            detail::stamp_into<false>(cal, 0, make_event(kEndStep));
-        }
-
         std::vector<uint64_t> ts;
         ts.reserve(static_cast<size_t>(kIters) * 2);
-        uint64_t cursor = 0;
-        while (true) {
-            auto [ptr, n] = cal.read(cursor);
-            if (ptr == nullptr || n == 0) {
-                break;
+
+        // Through whichever ring this session's stamps take. Both are local and
+        // filled by this thread, so plain reads, with no producer left to lap them.
+        if (session_->rings.count() > 0) {
+            std::vector<sample>   slots(kCapacity);
+            std::atomic<uint64_t> head{0};
+            detail::ring_writer   w;
+            w.attach({&head, slots.data(), kCapacity - 1});
+            for (int i = 0; i < kIters; ++i) {
+                detail::stamp_into<true>(w, 0, make_event(kBeginStep));
+                detail::stamp_into<false>(w, 0, make_event(kEndStep));
             }
-            for (uint32_t i = 0; i < n; ++i) {
-                // A plain read, unlike drain_once(): `cal` is a local ring that
-                // this thread filled and is now draining, with no producer left
-                // to lap it.
-                ts.push_back(ptr[i].timestamp);
+            for (int i = 0; i < kIters * 2; ++i) {
+                ts.push_back(slots[static_cast<size_t>(i)].timestamp);
+            }
+        } else {
+            sample_queue cal(kCapacity);
+            for (int i = 0; i < kIters; ++i) {
+                detail::stamp_into<true>(cal, 0, make_event(kBeginStep));
+                detail::stamp_into<false>(cal, 0, make_event(kEndStep));
+            }
+            uint64_t cursor = 0;
+            while (true) {
+                auto [ptr, n] = cal.read(cursor);
+                if (ptr == nullptr || n == 0) {
+                    break;
+                }
+                for (uint32_t i = 0; i < n; ++i) {
+                    ts.push_back(ptr[i].timestamp);
+                }
             }
         }
 
@@ -1128,7 +1607,7 @@ private:
             pairer_.sweep(detail::rdtsc_step(), age);
         }
 
-        const uint64_t loss       = ring_ ? ring_->loss_count() : 0;
+        const uint64_t loss       = (ring_ ? ring_->loss_count() : 0) + ring_lost_;
         const uint64_t new_losses = loss > last_loss_ ? loss - last_loss_ : 0;
         last_loss_ = loss;
 
@@ -1140,6 +1619,7 @@ private:
         reported_stalled_          = stalled_slots_;
 
         peak_open_.store(pairer_.peak_open_spans(), std::memory_order_release);
+        reclaim_dead_rings();
 
         build_reports(build_rows_, new_losses, new_stalled);
         write_csv(build_rows_, now, new_losses, new_stalled);
@@ -1797,15 +2277,40 @@ private:
     detail::tsc_clock clock_;
     Pairer            pairer_;
 
-    /// A ring shutdown() could not free. shm_name is empty for a local ring,
-    /// which holds no name anyone could ask for again.
+    struct TableDeleter {
+        void operator()(std::byte* p) const noexcept { ::operator delete(p, std::align_val_t{64}); }
+    };
+    using table_ptr = std::unique_ptr<std::byte, TableDeleter>;
+
+    /// A session shutdown() could not free: a stamp may still be in flight into
+    /// it. shm_name is empty for a local ring, which holds no name anyone could
+    /// ask for again.
     struct RetiredRing {
-        std::unique_ptr<sample_queue> ring;
-        std::string                   shm_name;
+        std::unique_ptr<sample_queue>              ring;
+        std::string                                shm_name;
+        std::unique_ptr<detail::session>           session;
+        table_ptr                                  table;
+        std::unique_ptr<slick::shm::shared_memory> meta;  ///< holds a shared session's rings
     };
 
     std::unique_ptr<sample_queue> ring_;
-    std::vector<RetiredRing>      retired_rings_;
+    /// Set from start() to shutdown(), so for the collector thread's whole
+    /// life: nothing on that thread checks it for null.
+    std::unique_ptr<detail::session> session_;
+    table_ptr                        table_;  ///< the thread rings, in local mode
+    std::vector<RetiredRing>         retired_rings_;
+
+    // ---- Merge state; collector thread only ----
+
+    std::vector<uint64_t>    ring_cursor_;    ///< next index to read, per ring
+    std::vector<uint64_t>    ring_wait_ts_;   ///< stamp a ring's cursor waits on; 0 = none
+    std::vector<sample>      merge_scratch_;  ///< kMergeChunk per ring
+    std::vector<MergeSource> sources_;
+    std::vector<uint32_t>    heap_;
+    std::vector<sample>      shared_stage_;   ///< shared-ring stamps, timestamp order
+    uint64_t                 ring_lost_       = 0;
+    uint64_t                 holdback_cycles_ = 0;
+    uint64_t                 skew_cycles_     = 0;
 
     std::thread           thread_;
     std::atomic<bool>     running_{false};

@@ -38,6 +38,7 @@ set(SLICK_PERFMON_LOGIC_TESTS
     test_open_map.cpp
     test_pairing.cpp
     test_seq.cpp
+    test_thread_ring.cpp
 )
 
 foreach(test_file IN LISTS SLICK_PERFMON_LOGIC_TESTS)
@@ -78,6 +79,7 @@ if(SLICK_PERFMON_ENABLED)
     set(SLICK_PERFMON_MEASURING_TESTS
         test_scoped.cpp
         test_collector.cpp
+        test_thread_rings.cpp
         test_tsc.cpp
         test_output.cpp
         # Pure logic, but the shared name table is a shm segment, and a disabled

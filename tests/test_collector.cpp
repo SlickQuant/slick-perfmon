@@ -169,30 +169,41 @@ TEST(CollectorTest, MultiStepSpansSumToTheirTotal) {
 
 TEST(CollectorTest, AnUndersizedRingReportsDropsRatherThanHidingThem) {
     // The ring overwrites rather than blocking, so a producer that outruns the
-    // collector loses samples. What matters is that it is counted.
-    Collector c;
-    config    cfg      = quiet_config();
-    cfg.point_count    = static_cast<point_id>(pt::count);
-    cfg.queue_capacity = 64;                             // deliberately tiny
-    cfg.poll_interval  = std::chrono::milliseconds(50);  // and slow to drain
-    ASSERT_TRUE(c.start(cfg));
+    // collector loses samples. What matters is that it is counted. Both rings a
+    // stamp can take: the thread's own, and the shared one with rings off.
+    // Regression: only queue_capacity was set, which sizes the shared ring, so
+    // the thread stamped into a default-sized ring of its own and dropped only
+    // when it happened to outrun the collector.
+    for (const bool thread_rings : {true, false}) {
+        SCOPED_TRACE(thread_rings ? "thread ring" : "shared ring");
+        Collector c;
+        config    cfg            = quiet_config();
+        cfg.point_count          = static_cast<point_id>(pt::count);
+        cfg.thread_ring_capacity = 64;                             // deliberately tiny
+        cfg.queue_capacity       = 64;
+        cfg.poll_interval        = std::chrono::milliseconds(50);  // and slow to drain
+        if (!thread_rings) {
+            cfg.max_thread_rings = 0;
+        }
+        ASSERT_TRUE(c.start(cfg));
 
-    for (int i = 0; i < 200000; ++i) {
-        begin(pt::work);
-        end(pt::work);
+        for (int i = 0; i < 200000; ++i) {
+            begin(pt::work);
+            end(pt::work);
+        }
+
+        const stats s = c.snapshot_total(to_point(pt::work));
+        EXPECT_GT(s.dropped, 0u) << "a 64-slot ring cannot have kept up";
+        EXPECT_LT(s.count, 200000u) << "lost stamps must show up as missing spans";
+
+        // Deliberately no assertion on orphan/abandoned here. The ring
+        // overwrites whole contiguous runs, so most losses take a begin and its
+        // end together and leave no trace beyond the count - only a skip that
+        // lands between the two produces an anomaly. `dropped` is the reliable
+        // signal that data was lost; the anomaly counters are what tells you a
+        // *surviving* span may have been mispaired.
+        c.shutdown();
     }
-
-    const stats s = c.snapshot_total(to_point(pt::work));
-    EXPECT_GT(s.dropped, 0u) << "a 64-slot ring cannot have kept up";
-    EXPECT_LT(s.count, 200000u) << "lost stamps must show up as missing spans";
-
-    // Deliberately no assertion on orphan/abandoned here. The ring overwrites
-    // whole contiguous runs, so most losses take a begin and its end together
-    // and leave no trace beyond the count - only a skip that lands between the
-    // two produces an anomaly. `dropped` is the reliable signal that data was
-    // lost; the anomaly counters are what tells you a *surviving* span may
-    // have been mispaired.
-    c.shutdown();
 }
 
 TEST(CollectorTest, SustainedMultiProducerLoadCanOutrunOneCollector) {
@@ -202,9 +213,10 @@ TEST(CollectorTest, SustainedMultiProducerLoadCanOutrunOneCollector) {
     // the ring will overwrite. The contract is not "never drops" - it is
     // "never drops silently".
     Collector c;
-    config    cfg      = quiet_config();
-    cfg.point_count    = 8;
-    cfg.queue_capacity = 1u << 12;  // small, to reach the condition quickly
+    config    cfg            = quiet_config();
+    cfg.point_count          = 8;
+    cfg.thread_ring_capacity = 1u << 12;  // small, to reach the condition quickly
+    cfg.queue_capacity       = 1u << 12;
     ASSERT_TRUE(c.start(cfg));
 
     constexpr int kThreads = 8;

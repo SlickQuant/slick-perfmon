@@ -1,5 +1,24 @@
 # Changelog
 
+## v0.5.0 - 11-26-2026
+
+### Added
+
+- `do_not_optimize(v)` keeps the work producing `v` inside the span. A result held in a
+  register and read only after `end()` could be computed after the closing timestamp, and
+  GCC, Clang and MSVC all did that at `-O2`. Free on GCC and Clang. On MSVC it costs one
+  stack store, plus a load for a non-const `v`.
+- `slick-perfmon-stamp_order` test, which checks the compiled order of work and stamps in
+  an assembly listing.
+
+### Fixed
+
+- The compiler could move memory operations across a fenced stamp, so a span could time
+  less than its work. GCC and MSVC move them across `RDTSCP`, MSVC treats `LFENCE` as a
+  load-only barrier, and MSVC removed a span's stores outright. Compiler barriers now go
+  before every fenced stamp and after the closing one: a one-byte `nop` each on MSVC
+  (three per begin/end pair), nothing elsewhere.
+
 ## v0.4.0 - 10-30-2026
 
 Breaking changes are in bold under Changed.

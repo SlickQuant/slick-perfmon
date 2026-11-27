@@ -99,7 +99,7 @@ include(FetchContent)
 FetchContent_Declare(
     slick-perfmon
     GIT_REPOSITORY https://github.com/SlickQuant/slick-perfmon.git
-    GIT_TAG v0.4.0
+    GIT_TAG v0.5.0
 )
 FetchContent_MakeAvailable(slick-perfmon)
 target_link_libraries(main PRIVATE slick::perfmon)
@@ -241,6 +241,26 @@ void on_tick(const md& m) {
 
 Four stamps produce three stage rows (`decode`, `match`, `publish`) plus a `total` row.
 The stage means add up to the total mean, with nothing unexplained.
+
+### Keep the work in the span
+
+The stamps stop memory operations crossing them, not values in registers. A result read
+only after `end()`, on one branch, may be computed after the closing timestamp. GCC,
+Clang and MSVC all do this at `-O2`, and the span then measures none of it. Pin the
+result before `end()`:
+
+```cpp
+slick::perfmon::begin(perf::hash);
+const uint64_t h = hash(msg);
+slick::perfmon::do_not_optimize(h);
+slick::perfmon::end(perf::hash);
+if (h == wanted) route(msg);
+```
+
+Free on GCC and Clang. On MSVC it costs one stack store, plus a load for a non-const
+argument. That one also counts as changed, so calling it on an input right after
+`begin()` stops work being hoisted above the opening stamp. Compiled out with
+`SLICK_PERFMON_ENABLED=0`, like the stamps.
 
 ### Scoped measurement
 
@@ -438,6 +458,8 @@ template <point_like T> void begin(T point, span_seq seq = kNoSeq) noexcept;
 template <point_like T> void step (T point, uint8_t n, span_seq seq = kNoSeq) noexcept;
 template <point_like T> void end  (T point, span_seq seq = kNoSeq) noexcept;
 template <point_like T> void value(T point, uint64_t v) noexcept;   // no span, no timestamp
+template <class T> void do_not_optimize(const T& v) noexcept;      // v is computed by here
+template <class T> void do_not_optimize(T& v) noexcept;            // ...and treated as changed
 
 void prepare_thread() noexcept;                    // claim this thread's ring up front
 void attach(const detail::session*) noexcept;      // a DLL stamping into the host's session
@@ -616,15 +638,21 @@ producer that dies leaves enough behind for the collector to reclaim the ring.
 small heap, pairing a stamp only once it is 2 ms old. The hold-back lets a span cross
 threads: a begin stamped just before a pass may not be visible yet, and pairing its end
 first would orphan it. Stamps from two rings with the same timestamp, which a coarse
-clock makes common, go in whichever order pairs cleanly. The ring keeps its newest `capacity - 1` samples, because
-after copying a chunk the collector reads the head again and discards whatever the
-producer may have reached meanwhile, counting it as `dropped`.
+clock makes common, go in whichever order pairs cleanly. The ring keeps its newest
+`capacity - 1` samples, because after copying a chunk the collector reads the head again
+and discards whatever the producer may have reached meanwhile, counting it as `dropped`.
 
 Intermediate stamps use `RDTSCP` because an intermediate stamp is simultaneously the
 close of one stage and the open of the next: it has to wait for prior work to retire
 *and* stop later work drifting up. `SLICK_PERFMON_SERIALIZE=0` drops the fences and buys
 back 30–70 cycles per stamp depending on the shape of the span, at the cost of letting
-the CPU move work across the timestamps.
+the CPU and the compiler move work across the timestamps.
+
+The fences bind the CPU, not the compiler. At `-O2` GCC and MSVC move memory operations
+across `RDTSC` and `RDTSCP`, and MSVC treats `LFENCE` as a load-only barrier, so a
+compiler barrier goes before every fenced stamp and after the closing one. They emit
+nothing on GCC and Clang and a one-byte `nop` each on MSVC, three per begin/end pair.
+Register-only work is not covered, which is what `do_not_optimize()` is for.
 
 **The record** is 16 bytes: a raw TSC, a 32-bit point and a 32-bit event holding
 `(seq << 8) | step`. The three fields are written with *relaxed* atomic stores and read
@@ -793,15 +821,18 @@ unpinned. Minimum of 15 repetitions of 20,000 iterations; run-to-run spread is a
 | Case | cycles/stamp | ns/stamp |
 |---|---|---|
 | Single stamp, fenced (default) | 172 | ~52 |
-| `begin`/`end` pair, fenced | 171 | ~52 |
-| `begin`/`end` pair with a runtime `seq` | 168 | ~51 |
-| 5-stage pipeline, 6 stamps | 194 | ~59 |
-| `SLICK_PERFMON_SCOPE` guard | 169 | ~51 |
-| Single stamp, `SLICK_PERFMON_SERIALIZE=0` | 128 | ~39 |
-| `begin`/`end` pair, `SLICK_PERFMON_SERIALIZE=0` | 95 | ~29 |
+| `begin`/`end` pair, fenced | 180 | ~55 |
+| `begin`/`end` pair with a runtime `seq` | 179 | ~54 |
+| 5-stage pipeline, 6 stamps | 193 | ~59 |
+| `SLICK_PERFMON_SCOPE` guard | 179 | ~54 |
+| Single stamp, `SLICK_PERFMON_SERIALIZE=0` | 132 | ~40 |
+| `begin`/`end` pair, `SLICK_PERFMON_SERIALIZE=0` | 96 | ~29 |
 | Value sample (`value()`, no timestamp) | **16** | ~5 |
-| Runtime-disabled | **2.5** | ~0.8 |
+| Runtime-disabled | **6.7** | ~2.0 |
 | Compile-time disabled (`SLICK_PERFMON_ENABLED=0`) | **0.0** | **0.0** |
+
+Runtime-disabled is two jumps over the stamp bodies, so code layout alone moves it
+between about 2.5 and 7 cycles from build to build.
 
 The next table has other threads stamping at the same time, in cycles, against v0.3.0's
 single shared ring. "Publish" is the per-call cost of one `value()`, with the two fenced
@@ -833,14 +864,14 @@ Five things worth reading off those tables:
   runtime correlation id.
 - **Compiled out really is nothing.** Every stamp case in the `SLICK_PERFMON_ENABLED=0`
   build measures 0.0 cycles — the optimizer removes the calls entirely. The one case
-  that does not is the runtime-`seq` pair, at 1.7 cycles per iteration: that is the
+  that does not is the runtime-`seq` pair, at ~1.8 cycles per stamp: that is the
   `volatile` the benchmark itself uses to keep the id alive, with no stamp left in the
   loop to attribute it to.
 
 ### An honest comparison with `std::chrono`
 
 In the same benchmark, a bare `steady_clock::now()` pair costs **~300 cycles (~150 per
-call)** on this machine. A slick-perfmon `begin`/`end` pair costs ~340. **slick-perfmon
+call)** on this machine. A slick-perfmon `begin`/`end` pair costs ~360. **slick-perfmon
 is not cheaper than reading the clock**, and on Linux, where `steady_clock` is a vDSO
 `clock_gettime` at roughly 70 cycles, it is clearly more expensive per timestamp.
 
@@ -918,6 +949,11 @@ that end to end: it installs a fresh configure of the tree under a non-default i
 directory and builds a `find_package` consumer against it. Being a nested configure and
 build, it is the slowest test in the suite.
 
+`slick-perfmon-stamp_order` compiles `tests/codegen/stamp_order.cpp` to assembly at `-O2`
+(`/O2` on MSVC) in every configuration and checks that marked stores and divisions sit
+between the stamps timing them. A span the compiler emptied still returns a plausible
+number, so only the listing shows it. It reports Skipped without fenced x86 stamps.
+
 Configuring with `-DSLICK_PERFMON_ENABLED=OFF` builds and tests the whole tree as well.
 The tests that assert measurement *works* are not registered in that configuration —
 they cannot pass when every stamp has been compiled away — but the encoding, pairing,
@@ -944,9 +980,9 @@ fast the rings fill rather than what a stamp costs.
 
 The last block measures the collector rather than the hot path: pairing one drained
 event, accumulating one drained value (~65 cycles against ~90 for a paired stamp, as it
-skips the span table), expiring abandoned spans, and rebuilding the report rows. None of it is part of
-the overhead budget, but all of it is time the ring is not being drained, so it is what
-decides whether a busy session drops samples.
+skips the span table), expiring abandoned spans, and rebuilding the report rows. None of
+it is part of the overhead budget, but all of it is time the ring is not being drained,
+so it is what decides whether a busy session drops samples.
 
 ## Compile-time tunables
 

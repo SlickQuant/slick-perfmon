@@ -28,6 +28,7 @@
 #include <slick/perfmon/queue.hpp>
 
 #include <atomic>
+#include <type_traits>
 
 namespace slick::perfmon {
 
@@ -252,6 +253,82 @@ SLICK_PERFMON_FORCE_INLINE void end(T p, span_seq seq = kNoSeq) noexcept {
     stamp<false>(to_point(p), make_event(kEndStep, seq));
 }
 
+namespace detail {
+template <class T>
+inline constexpr bool in_gpr = (std::is_integral_v<T> || std::is_enum_v<T> ||
+                                std::is_pointer_v<T>) && sizeof(T) <= sizeof(void*);
+#if defined(__x86_64__) || defined(__i386__)
+template <class T>
+inline constexpr bool in_xmm = std::is_floating_point_v<T> && sizeof(T) <= 8;
+#else
+template <class T>
+inline constexpr bool in_xmm = false;
+#endif
+}  // namespace detail
+
+/**
+ * @brief Make @p v count as used here, so the work producing it stays in the span.
+ *
+ * The stamps fence memory, not registers. A result that lives in a register
+ * and is next read after end() may be computed after the closing RDTSCP, and
+ * GCC, Clang and MSVC all do that at -O2 when the read is on one branch: the
+ * span then measures none of it. Call this on the result before end().
+ *
+ * The non-const overload also tells the compiler @p v changed, so work reading
+ * it can't start earlier. Call it on an input after begin() to keep that work
+ * from being hoisted above the opening stamp.
+ *
+ * Free on GCC and Clang. MSVC has no x64 inline asm, so there it costs one
+ * stack store (const) or a store and a load.
+ */
+#if defined(__GNUC__) || defined(__clang__)
+template <class T>
+SLICK_PERFMON_FORCE_INLINE void do_not_optimize(const T& v) noexcept {
+    if constexpr (detail::in_gpr<T>) {
+        asm volatile("" : : "r"(v) : "memory");
+    } else if constexpr (detail::in_xmm<T>) {
+        asm volatile("" : : "x"(v) : "memory");
+    } else {
+        asm volatile("" : : "m"(v) : "memory");
+    }
+}
+
+template <class T>
+SLICK_PERFMON_FORCE_INLINE void do_not_optimize(T& v) noexcept {
+    if constexpr (detail::in_gpr<T>) {
+        asm volatile("" : "+r"(v) : : "memory");
+    } else if constexpr (detail::in_xmm<T>) {
+        asm volatile("" : "+x"(v) : : "memory");
+    } else {
+        asm volatile("" : "+m"(v) : : "memory");
+    }
+}
+#else
+// A scalar is stored to a volatile; anything else escapes by address. Either
+// way the barrier then stops the compiler deferring the value past this point.
+// No `(void)sink`: that is a volatile read, and an extra load.
+template <class T>
+SLICK_PERFMON_FORCE_INLINE void do_not_optimize(const T& v) noexcept {
+    if constexpr (std::is_scalar_v<T>) {
+        [[maybe_unused]] volatile T sink = v;
+    } else {
+        [[maybe_unused]] const volatile void* volatile sink = &v;
+    }
+    detail::compiler_barrier();
+}
+
+template <class T>
+SLICK_PERFMON_FORCE_INLINE void do_not_optimize(T& v) noexcept {
+    if constexpr (std::is_scalar_v<T>) {
+        volatile T sink = v;
+        v = sink;
+    } else {
+        [[maybe_unused]] void* volatile sink = &v;
+    }
+    detail::compiler_barrier();
+}
+#endif
+
 /**
  * @brief Record one value on a point: a queue depth, a batch size, a byte
  *        count - a number that is a measurement in itself.
@@ -349,6 +426,9 @@ SLICK_PERFMON_FORCE_INLINE void step(T, uint8_t, span_seq = kNoSeq) noexcept {}
 
 template <point_like T>
 SLICK_PERFMON_FORCE_INLINE void end(T, span_seq = kNoSeq) noexcept {}
+
+template <class T>
+SLICK_PERFMON_FORCE_INLINE void do_not_optimize(const T&) noexcept {}
 
 template <point_like T>
 SLICK_PERFMON_FORCE_INLINE void value(T, uint64_t) noexcept {}

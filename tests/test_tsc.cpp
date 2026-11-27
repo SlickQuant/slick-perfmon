@@ -31,6 +31,35 @@ TEST(Tsc, CounterAdvancesMonotonically) {
     EXPECT_NE(a, 0u) << "zero is the disabled sentinel and must never be a real reading";
 }
 
+TEST(Tsc, DoNotOptimizeLeavesTheValueAlone) {
+    // Every register class through both overloads. Where work lands is checked
+    // by slick-perfmon-stamp_order; this checks the asm constraints compile and
+    // the read-write overload writes back what it was given.
+    struct pair_u64 {
+        uint64_t a, b;
+    };
+    uint64_t       u  = 0x0123456789ABCDEFull;
+    double         d  = 3.25;
+    float          f  = 1.5f;
+    pair_u64       s  = {1, 2};
+    const uint64_t cu = u;
+    const double   cd = d;
+    const pair_u64 cs = s;
+    do_not_optimize(u);
+    do_not_optimize(d);
+    do_not_optimize(f);
+    do_not_optimize(s);
+    do_not_optimize(cu);
+    do_not_optimize(cd);
+    do_not_optimize(cs);
+    do_not_optimize(u + 1);
+    EXPECT_EQ(u, 0x0123456789ABCDEFull);
+    EXPECT_EQ(d, 3.25);
+    EXPECT_EQ(f, 1.5f);
+    EXPECT_EQ(s.a, 1u);
+    EXPECT_EQ(s.b, 2u);
+}
+
 TEST(Tsc, InvariantProbeDoesNotCrash) {
     // The answer is whatever this CPU says; what matters is that the CPUID path
     // is safe on every machine, including ones without leaf 0x80000007.

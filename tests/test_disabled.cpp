@@ -49,6 +49,11 @@ TEST(Disabled, EveryEntryPointStillCompiles) {
     stamp<true>(0, make_event(kBeginStep));
     attach(nullptr);
     prepare_thread();
+    uint64_t       r = 7;
+    const uint64_t c = 7;
+    do_not_optimize(r);
+    do_not_optimize(c);
+    do_not_optimize(r + c);
     SUCCEED();
 }
 

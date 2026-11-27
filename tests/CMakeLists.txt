@@ -102,6 +102,9 @@ if(SLICK_PERFMON_ENABLED)
     target_compile_definitions(slick-perfmon-test_shm PRIVATE
         PRODUCER_EXE_PATH="$<TARGET_FILE:slick-perfmon-test-producer>")
     add_dependencies(slick-perfmon-test_shm slick-perfmon-test-producer)
+
+    # Work moved across a stamp by the compiler: checked in the asm listing.
+    add_subdirectory(codegen)
 else()
     message(STATUS
         "slick-perfmon: instrumentation disabled - skipping the measurement tests")

@@ -5,6 +5,7 @@
 
 #include <slick/perfmon/config.hpp>
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 
@@ -27,7 +28,19 @@ namespace slick::perfmon::detail {
 // nothing to stop *later* work drifting up above it, which is what the trailing
 // LFENCE is for. An intermediate stamp in a multi-step span is simultaneously
 // the close of one stage and the open of the next, so it uses the closing form.
+//
+// The fences stop the CPU, not the compiler. At -O2 GCC and MSVC move memory
+// ops across RDTSC and RDTSCP, and MSVC across LFENCE too, which it treats as
+// a load-only barrier. So compiler_barrier() goes before every fenced stamp and
+// after the closing one. Work that never touches memory is not covered; see
+// do_not_optimize().
 // ============================================================================
+
+/// Compiler-only barrier: no memory op crosses it. No instruction on GCC and
+/// Clang; MSVC emits a one-byte nop for it.
+SLICK_PERFMON_FORCE_INLINE void compiler_barrier() noexcept {
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+}
 
 #if SLICK_PERFMON_X86
 
@@ -35,8 +48,11 @@ namespace slick::perfmon::detail {
 /// it may run early.
 SLICK_PERFMON_FORCE_INLINE uint64_t rdtsc_begin() noexcept {
 #if SLICK_PERFMON_SERIALIZE
+    compiler_barrier();
     _mm_lfence();
     const uint64_t t = __rdtsc();
+    // No trailing barrier: GCC and Clang treat LFENCE as a full one, and MSVC
+    // keeps stores below RDTSC and loads below LFENCE.
     _mm_lfence();
     return t;
 #else
@@ -49,8 +65,10 @@ SLICK_PERFMON_FORCE_INLINE uint64_t rdtsc_begin() noexcept {
 SLICK_PERFMON_FORCE_INLINE uint64_t rdtsc_step() noexcept {
     unsigned aux;
 #if SLICK_PERFMON_SERIALIZE
+    compiler_barrier();
     const uint64_t t = __rdtscp(&aux);
     _mm_lfence();
+    compiler_barrier();
 #else
     const uint64_t t = __rdtscp(&aux);
 #endif

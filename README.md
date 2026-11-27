@@ -646,7 +646,10 @@ Intermediate stamps use `RDTSCP` because an intermediate stamp is simultaneously
 close of one stage and the open of the next: it has to wait for prior work to retire
 *and* stop later work drifting up. `SLICK_PERFMON_SERIALIZE=0` drops the fences and buys
 back 30–70 cycles per stamp depending on the shape of the span, at the cost of letting
-the CPU and the compiler move work across the timestamps.
+the CPU and the compiler move work across the timestamps. That includes a handoff: a
+thread that waits for another and then calls `begin()` can read the TSC before the wait
+has finished, so a span crossing threads now and then pairs out of order, counted as an
+`orphan` and an `abandoned`.
 
 The fences bind the CPU, not the compiler. At `-O2` GCC and MSVC move memory operations
 across `RDTSC` and `RDTSCP`, and MSVC treats `LFENCE` as a load-only barrier, so a

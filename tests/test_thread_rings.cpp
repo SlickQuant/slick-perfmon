@@ -72,12 +72,23 @@ void expect_clean(const stats& s, uint64_t count) {
     EXPECT_EQ(s.invalid, 0u);
 }
 
+/// An unfenced RDTSC can run before the spin ahead of it has seen the other
+/// thread, so the next begin is stamped before the end it waited for and two
+/// spans pair out of order. That is the SERIALIZE=0 trade-off, not what these
+/// tests check. RDTSCP waits for earlier loads, so an end needs no fence.
+void fence_handoff() noexcept {
+#if SLICK_PERFMON_X86 && !SLICK_PERFMON_SERIALIZE
+    _mm_lfence();
+#endif
+}
+
 /// begin on @p opener, end on @p closer, one span at a time, @p n times.
 void cross_thread_spans(int n, bool reverse = false) {
     std::atomic<int> opened{0};
     std::atomic<int> closed{0};
     auto opener = [&] {
         for (int i = 1; i <= n; ++i) {
+            fence_handoff();
             begin(kSpan);
             opened.store(i, std::memory_order_release);
             while (closed.load(std::memory_order_acquire) != i) {

@@ -8,8 +8,8 @@
   register and read only after `end()` could be computed after the closing timestamp, and
   GCC, Clang and MSVC all did that at `-O2`. Free on GCC and Clang. On MSVC it costs one
   stack store, plus a load for a non-const `v`.
-- `slick-perfmon-stamp_order` test, which checks the compiled order of work and stamps in
-  an assembly listing.
+- `slick-perfmon-stamp_order` test, which checks the order of work and stamps in the
+  compiled code.
 
 ### Fixed
 

@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Slick Quant
 //
-// Compiled to assembly, never run. check_stamp_order.cmake reads the listing
-// and checks each marked piece of work sits between the stamps timing it. A
-// span whose work the compiler moved out still returns a plausible number, so
-// no runtime test can see this.
+// Compiled, never run. check_stamp_order.cmake reads the code (the -S listing,
+// or dumpbin's disassembly on MSVC) and checks each marked piece of work sits
+// between the stamps timing it. A span whose work the compiler moved out still
+// returns a plausible number, so no runtime test can see this.
 
 #include <slick/perfmon.hpp>
 

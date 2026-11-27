@@ -949,10 +949,11 @@ that end to end: it installs a fresh configure of the tree under a non-default i
 directory and builds a `find_package` consumer against it. Being a nested configure and
 build, it is the slowest test in the suite.
 
-`slick-perfmon-stamp_order` compiles `tests/codegen/stamp_order.cpp` to assembly at `-O2`
-(`/O2` on MSVC) in every configuration and checks that marked stores and divisions sit
-between the stamps timing them. A span the compiler emptied still returns a plausible
-number, so only the listing shows it. It reports Skipped without fenced x86 stamps.
+`slick-perfmon-stamp_order` compiles `tests/codegen/stamp_order.cpp` at `-O2` (`/O2` on
+MSVC) in every configuration and checks in the generated code (the `-S` listing, or
+dumpbin's disassembly on MSVC) that marked stores and divisions sit between the stamps
+timing them. A span the compiler emptied still returns a plausible number, so only the
+code shows it. It reports Skipped without fenced x86 stamps, or on MSVC without dumpbin.
 
 Configuring with `-DSLICK_PERFMON_ENABLED=OFF` builds and tests the whole tree as well.
 The tests that assert measurement *works* are not registered in that configuration —
